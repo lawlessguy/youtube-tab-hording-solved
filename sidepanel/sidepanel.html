@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <div class="panel">
+    <div class="sticky-top">
+      <!-- Header: Watch Time + Refresh -->
+      <header>
+        <div class="watch-bar">
+          <span>Today: <b id="watch-today">0m</b></span>
+          <span class="sep">&middot;</span>
+          <span>Week: <b id="watch-week">0m</b></span>
+          <span class="sep">&middot;</span>
+          <span>Month: <b id="watch-month">0m</b></span>
+          <span class="sep">&middot;</span>
+          <span>Year: <b id="watch-year">0m</b></span>
+        </div>
+        <button class="header-icon-btn" id="refresh-metadata">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+        </button>
+      </header>
+
+      <!-- Toggle Bar: All buttons, same size, labeled -->
+      <div class="toggle-bar">
+        <button class="tb-btn tb-btn--collect" id="collect-tabs" data-desc="Collect all open YouTube tabs into the queue">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="8,17 12,21 16,17"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.88,18.09A5,5,0,0,0,18,9h-1.26A8,8,0,1,0,3,16.29"/></svg>
+          <span class="tb-label">Collect</span>
+        </button>
+        <button class="tb-btn tb-btn--close" id="close-tabs" data-desc="Close YouTube tabs matching visible list">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <span class="tb-label">Close</span>
+        </button>
+        <button class="tb-btn tb-btn--intercept" id="tb-intercept" data-desc="Intercept new YouTube tabs and add to queue">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          <span class="tb-label">Intercept</span>
+        </button>
+        <button class="tb-btn" id="tb-autoplay" data-desc="Auto-play next video when current one ends">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5,3 19,12 5,21"/><line x1="19" y1="5" x2="19" y2="19" stroke-width="3"/></svg>
+          <span class="tb-label">Autoplay</span>
+        </button>
+        <button class="tb-btn" id="tb-videoinfo" data-desc="Show views &amp; upload date above YouTube actions bar">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+          <span class="tb-label">Info</span>
+        </button>
+        <button class="tb-btn" id="tb-hiderecs" data-desc="Hide recommendations &amp; move comments to sidebar">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <span class="tb-label">Hide</span>
+        </button>
+      </div>
+      <div class="toggle-desc" id="toggle-desc">&nbsp;</div>
+
+      <!-- Volume & Speed -->
+      <div class="controls-bar">
+        <div class="ctrl-row">
+          <span class="ctrl-icon clickable" id="volume-reset">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/><path d="M15.54,8.46a5,5,0,0,1,0,7.07"/></svg>
+          </span>
+          <input type="range" id="volume-slider" min="0" max="1000" value="100" step="10" class="slider">
+          <span class="ctrl-val" id="volume-value">100%</span>
+        </div>
+        <div class="ctrl-row">
+          <span class="ctrl-icon clickable" id="speed-reset">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5,4 15,12 5,20"/><line x1="19" y1="5" x2="19" y2="19"/></svg>
+          </span>
+          <input type="range" id="speed-slider" min="0" max="100" value="10" class="slider">
+          <span class="ctrl-val" id="speed-value">1.0x</span>
+        </div>
+      </div>
+
+      <!-- Sort + Search -->
+      <div class="filter-search-bar">
+        <div class="sort-btns">
+          <button class="sort-btn active" data-sort="addedAt">Added</button>
+          <button class="sort-btn" data-sort="duration">Length</button>
+          <button class="sort-btn" data-sort="uploadedAt">Uploaded</button>
+          <button class="sort-dir" id="sort-direction">&#8595;</button>
+        </div>
+        <div class="search-inline">
+          <svg class="search-icon" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="search-input" class="search-input" placeholder="Search...">
+          <button class="search-clear" id="search-clear" style="display:none">
+            <svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Videos / Shorts Tabs -->
+      <div class="content-tabs">
+        <button class="content-tab active" data-tab="videos" id="tab-videos">Videos (<span id="video-count">0</span>)</button>
+        <button class="content-tab" data-tab="shorts" id="tab-shorts">Shorts (<span id="shorts-count">0</span>)</button>
+      </div>
+    </div>
+
+    <!-- SCROLLABLE CONTENT -->
+    <div class="scroll-area">
+      <!-- Now Playing (active video priority slot) -->
+      <div id="now-playing" style="display:none"></div>
+
+      <div class="video-list" id="video-list"></div>
+      <div class="video-list" id="shorts-list" style="display:none"></div>
+
+      <!-- Watched Section (collapsible, collapsed by default) -->
+      <div class="section">
+        <div class="section-head collapsible" id="watched-header">
+          <span class="collapse-icon collapsed">&#9660;</span>
+          <span>Watched (<span id="watched-count">0</span>)</span>
+        </div>
+        <div class="video-list collapsed" id="watched-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>
