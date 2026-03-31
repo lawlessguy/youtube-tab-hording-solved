@@ -104,29 +104,30 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 // --- Silent Background Logging ---
 
-async function logVideoSilently(url, videoId) {
+async function logVideoSilently(url, videoId, starred) {
   const logged = await storage.get(STORAGE_KEYS.LOGGED_VIDEOS) || [];
   const existing = logged.find(v => v.id === videoId);
   if (existing) {
     existing.timestamp = Date.now();
+    if (starred) existing.starred = true; // never unstar
     await storage.set(STORAGE_KEYS.LOGGED_VIDEOS, logged);
     return;
   }
-  logged.push({ id: videoId, url, isShort: isShortUrl(url), timestamp: Date.now() });
+  logged.push({ id: videoId, url, isShort: isShortUrl(url), timestamp: Date.now(), starred: !!starred });
   await storage.set(STORAGE_KEYS.LOGGED_VIDEOS, logged);
 }
 
 // --- Video Queue ---
 
-async function addVideoToQueue(url, videoId, explicitTimestamp) {
+async function addVideoToQueue(url, videoId, explicitTimestamp, starred) {
   videoId = videoId || extractVideoId(url);
   if (!videoId) return null;
 
   const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
   const existing = videos.find(v => v.id === videoId);
   if (existing) {
-    // Update addedAt so it moves to the top when sorted by "Added"
     existing.addedAt = explicitTimestamp || Date.now();
+    if (starred) existing.starred = true;
     await storage.set(STORAGE_KEYS.VIDEOS, videos);
     broadcast({ type: MSG.VIDEOS_UPDATED });
     return null;
@@ -147,6 +148,7 @@ async function addVideoToQueue(url, videoId, explicitTimestamp) {
     isShort,
     category: 'Uncategorized',
     watched: false,
+    starred: !!starred,
     order: videos.length,
   };
 
@@ -441,10 +443,10 @@ async function handleMessage(message, sender) {
         }
       }
 
-      // Also pull from silently logged videos
+      // Also pull from silently logged videos (carry starred flag)
       const logged = await storage.get(STORAGE_KEYS.LOGGED_VIDEOS) || [];
       for (const entry of logged) {
-        const video = await addVideoToQueue(entry.url, entry.id, entry.timestamp);
+        const video = await addVideoToQueue(entry.url, entry.id, entry.timestamp, entry.starred);
         if (video) added++;
       }
       await storage.set(STORAGE_KEYS.LOGGED_VIDEOS, []);
@@ -702,6 +704,40 @@ async function handleMessage(message, sender) {
       return { tabId: tab.id };
     }
 
+    case MSG.TAG_STARRED: {
+      const vid = message.videoId;
+      if (!vid) return { success: false };
+      // Check queue first
+      const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
+      const qv = videos.find(v => v.id === vid);
+      if (qv) {
+        qv.starred = true;
+        await storage.set(STORAGE_KEYS.VIDEOS, videos);
+        broadcast({ type: MSG.VIDEOS_UPDATED });
+        return { success: true };
+      }
+      // Check logged videos
+      const logged = await storage.get(STORAGE_KEYS.LOGGED_VIDEOS) || [];
+      const lv = logged.find(v => v.id === vid);
+      if (lv) {
+        lv.starred = true;
+        await storage.set(STORAGE_KEYS.LOGGED_VIDEOS, logged);
+        return { success: true };
+      }
+      // Not found anywhere — log it as starred
+      if (message.url) {
+        await logVideoSilently(message.url, vid, true);
+      }
+      return { success: true };
+    }
+
+    case MSG.GET_QUEUED_IDS: {
+      const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
+      const queued = videos.filter(v => !v.watched).map(v => v.id);
+      const watched = videos.filter(v => v.watched).map(v => v.id);
+      return { ids: queued, watched };
+    }
+
     case MSG.RESET_CATEGORIES: {
       const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
       videos.forEach(v => { v.category = 'Uncategorized'; });
@@ -728,7 +764,6 @@ async function handleMessage(message, sender) {
     }
 
     case MSG.SKIP_VIDEO: {
-      // Mark current video as watched and navigate to next
       const currentVideoId = message.videoId;
       const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
 
@@ -742,26 +777,34 @@ async function handleMessage(message, sender) {
         }
       }
 
-      // Find next unwatched video
-      const settings = await storage.get(STORAGE_KEYS.SETTINGS) || DEFAULT_SETTINGS;
-      const unwatched = videos.filter(v => !v.watched && !v.isShort);
-      const sorted = sortVideosList(unwatched, settings.sortBy || 'addedAt', settings.sortDirection || 'desc');
+      // Use the ordered next-video list from the side panel if provided
+      let nextVideo = null;
+      const nextIds = message.nextVideoIds || [];
+      for (const nid of nextIds) {
+        const v = videos.find(vv => vv.id === nid && !vv.watched);
+        if (v) { nextVideo = v; break; }
+      }
 
-      if (sorted.length > 0) {
-        const next = sorted[0];
-        // Navigate the active YouTube tab to the next video
+      // Fallback: use default sort if no list provided
+      if (!nextVideo) {
+        const settings = await storage.get(STORAGE_KEYS.SETTINGS) || DEFAULT_SETTINGS;
+        const unwatched = videos.filter(v => !v.watched);
+        const sorted = sortVideosList(unwatched, settings.sortBy || 'addedAt', settings.sortDirection || 'desc');
+        if (sorted.length > 0) nextVideo = sorted[0];
+      }
+
+      if (nextVideo) {
         const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
         if (activeTab && activeTab.url && activeTab.url.includes('youtube.com')) {
           extensionOpenedTabs.add(activeTab.id);
           setTimeout(() => extensionOpenedTabs.delete(activeTab.id), 5000);
-          await chrome.tabs.update(activeTab.id, { url: next.url });
-          return { success: true, nextId: next.id };
+          await chrome.tabs.update(activeTab.id, { url: nextVideo.url });
+          return { success: true, nextId: nextVideo.id };
         } else {
-          // Open in new tab
-          const tab = await chrome.tabs.create({ url: next.url, active: true });
+          const tab = await chrome.tabs.create({ url: nextVideo.url, active: true });
           extensionOpenedTabs.add(tab.id);
           setTimeout(() => extensionOpenedTabs.delete(tab.id), 30000);
-          return { success: true, nextId: next.id };
+          return { success: true, nextId: nextVideo.id };
         }
       }
       return { success: true, nextId: null };
@@ -783,17 +826,31 @@ async function handleMessage(message, sender) {
       if (!settings?.autoPlayNext) return { autoPlayed: false };
 
       const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
-      const unwatched = videos.filter(v => !v.watched && !v.isShort);
-      const sorted = sortVideosList(unwatched, settings.sortBy || 'addedAt', settings.sortDirection || 'desc');
 
-      if (sorted.length > 0) {
-        const next = sorted[0];
+      // Use the stored next-video order from the side panel if available
+      let nextVideo = null;
+      const storedOrder = await storage.get('yt_next_video_order');
+      if (storedOrder && Array.isArray(storedOrder)) {
+        for (const nid of storedOrder) {
+          const v = videos.find(vv => vv.id === nid && !vv.watched);
+          if (v) { nextVideo = v; break; }
+        }
+      }
+
+      // Fallback
+      if (!nextVideo) {
+        const unwatched = videos.filter(v => !v.watched);
+        const sorted = sortVideosList(unwatched, settings.sortBy || 'addedAt', settings.sortDirection || 'desc');
+        if (sorted.length > 0) nextVideo = sorted[0];
+      }
+
+      if (nextVideo) {
         const tabId = sender.tab?.id;
         if (tabId) {
-          extensionOpenedTabs.add(tabId); // Prevent interception on navigation
+          extensionOpenedTabs.add(tabId);
           setTimeout(() => extensionOpenedTabs.delete(tabId), 5000);
-          await chrome.tabs.update(tabId, { url: next.url });
-          return { autoPlayed: true, videoId: next.id };
+          await chrome.tabs.update(tabId, { url: nextVideo.url });
+          return { autoPlayed: true, videoId: nextVideo.id };
         }
       }
       return { autoPlayed: false };

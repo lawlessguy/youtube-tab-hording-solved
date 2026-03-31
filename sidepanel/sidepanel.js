@@ -5,6 +5,7 @@ let sortDirection = 'desc';
 let watchedCollapsed = true;
 let activeTab = 'videos'; // 'videos' or 'shorts'
 let searchQuery = '';
+let starFilterActive = false;
 let nowPlayingVideoId = null;
 let lastMediaState = null;
 let cachedVideos = [];
@@ -106,6 +107,7 @@ async function loadVideos() {
     const watched = allVideos.filter(v => v.watched);
 
     let filtered = unwatched;
+    if (starFilterActive) filtered = filtered.filter(v => v.starred);
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       filtered = filtered.filter(v =>
@@ -130,7 +132,21 @@ async function loadVideos() {
     document.getElementById('shorts-list').style.display = activeTab === 'shorts' ? '' : 'none';
 
     applyCollapsed('watched-list', '#watched-header .collapse-icon', watchedCollapsed);
+    storeVisibleVideoOrder();
   } catch (e) { console.error('Videos error:', e); }
+}
+
+// Returns the ordered list of video IDs as currently visible in the side panel
+function getVisibleVideoOrder() {
+  const listId = activeTab === 'videos' ? 'video-list' : 'shorts-list';
+  return [...document.querySelectorAll('#' + listId + ' .video-item')]
+    .map(item => item.dataset.id).filter(Boolean);
+}
+
+// Persist the visible order to storage so auto-play (VIDEO_ENDED) can use it
+function storeVisibleVideoOrder() {
+  const order = getVisibleVideoOrder();
+  chrome.storage.local.set({ yt_next_video_order: order });
 }
 
 function applyCollapsed(listId, iconSel, isCollapsed) {
@@ -183,6 +199,13 @@ function buildVideoItem(v, _unused, isWatched) {
     });
   }
 
+  const starBtn = el('button', { class: 'card-star-btn' + (v.starred ? ' starred' : ''), text: '\u2605' });
+  starBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    const newVal = !v.starred;
+    msg({ type: 'UPDATE_VIDEO', videoId: v.id, updates: { starred: newVal } }).then(loadVideos);
+  });
+
   const metaChildren = [
     el('span', { text: v.channel || 'Unknown' }),
     el('span', { class: 'dot', text: ' ' }),
@@ -205,7 +228,7 @@ function buildVideoItem(v, _unused, isWatched) {
       el('div', { class: 'video-title', title: v.title || '', text: v.title || 'Unknown' }),
       el('div', { class: 'video-meta' }, metaChildren),
     ]),
-    el('div', { class: 'card-right' }, [playBtn, el('div', { class: 'card-bottom-actions' }, [removeBtn, watchBtn])]),
+    el('div', { class: 'card-right' }, [playBtn, el('div', { class: 'card-bottom-actions' }, [starBtn, removeBtn, watchBtn])]),
   ]);
 
   item.addEventListener('dblclick', e => {
@@ -276,7 +299,7 @@ function buildNowPlayingCard(video, state) {
   const skipBtn = el('button', { class: 'np-btn np-btn--skip' });
   skipBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,4 15,12 5,20"/><rect x="17" y="5" width="3" height="14"/></svg>';
   skipBtn.addEventListener('click', async () => {
-    await msg({ type: 'SKIP_VIDEO', videoId: video.id });
+    await msg({ type: 'SKIP_VIDEO', videoId: video.id, nextVideoIds: getVisibleVideoOrder() });
     loadVideos();
   });
 
@@ -382,6 +405,7 @@ document.querySelectorAll('.content-tab').forEach(tab => {
     activeTab = tab.dataset.tab;
     document.getElementById('video-list').style.display = activeTab === 'videos' ? '' : 'none';
     document.getElementById('shorts-list').style.display = activeTab === 'shorts' ? '' : 'none';
+    storeVisibleVideoOrder();
   });
 });
 
@@ -421,6 +445,7 @@ document.getElementById('tb-intercept').addEventListener('click', () => {
   const current = btn.dataset.state || 'off';
   const next = interceptStates[(interceptStates.indexOf(current) + 1) % interceptStates.length];
   setInterceptState(next);
+  descEl.textContent = interceptDescs[next];
   msg({ type: 'UPDATE_SETTINGS', settings: { interceptEnabled: next } });
 });
 
@@ -555,6 +580,14 @@ document.getElementById('close-tabs').addEventListener('click', async () => {
   if (videoIds.length > 0) {
     await msg({ type: 'CLOSE_VISIBLE_TABS', videoIds });
   }
+});
+
+// Star filter
+document.getElementById('star-filter').addEventListener('click', () => {
+  starFilterActive = !starFilterActive;
+  document.getElementById('star-filter').classList.toggle('active', starFilterActive);
+  loadVideos();
+  document.querySelector('.scroll-area').scrollTop = 0;
 });
 
 // Sort

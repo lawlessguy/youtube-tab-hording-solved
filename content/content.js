@@ -8,6 +8,20 @@
   let hasMarkedWatched = false;
   const FLUSH_INTERVAL = 30000;
 
+  // Check if the extension context is still valid (becomes invalid after reload/update)
+  function isContextValid() {
+    try { return !!chrome.runtime?.id; }
+    catch { return false; }
+  }
+
+  // Safe message sender — chrome.runtime.sendMessage throws synchronously
+  // when the extension context is invalidated (e.g. after extension reload)
+  function safeSend(data) {
+    if (!isContextValid()) return Promise.resolve();
+    try { return chrome.runtime.sendMessage(data).catch(() => {}); }
+    catch { return Promise.resolve(); }
+  }
+
   // --- URL Parsing ---
 
   function getCurrentVideoId() {
@@ -69,7 +83,7 @@
       hasMarkedWatched = true;
       const videoId = getCurrentVideoId();
       if (videoId) {
-        chrome.runtime.sendMessage({ type: 'MARK_WATCHED', videoId }).catch(() => {});
+        safeSend({ type: 'MARK_WATCHED', videoId });
       }
     }
   }
@@ -82,10 +96,10 @@
     video._ytmEndedBound = true;
     video.addEventListener('ended', () => {
       const videoId = getCurrentVideoId();
-      chrome.runtime.sendMessage({
+      safeSend({
         type: 'VIDEO_ENDED',
         videoId: videoId || undefined,
-      }).catch(() => {});
+      });
     });
   }
 
@@ -95,7 +109,8 @@
 
   async function applyStoredSettings() {
     try {
-      const settings = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' });
+      const settings = await safeSend({ type: 'GET_SETTINGS' });
+      if (!settings) return;
       if (settings.volumeLevel !== undefined && settings.volumeLevel !== 100) {
         setVolume(settings.volumeLevel);
       }
@@ -115,6 +130,7 @@
   function startTracking() {
     if (trackingInterval) clearInterval(trackingInterval);
     trackingInterval = setInterval(() => {
+      if (!isContextValid()) { clearInterval(trackingInterval); return; }
       const video = getVideoElement();
       if (video && !video.paused && !video.ended) {
         accumulatedSeconds++;
@@ -122,7 +138,7 @@
       }
     }, 1000);
 
-    setInterval(() => { flushWatchTime(); }, FLUSH_INTERVAL);
+    setInterval(() => { if (isContextValid()) flushWatchTime(); }, FLUSH_INTERVAL);
     setupEndedListener();
     setupAutoApply();
     applyStoredSettings();
@@ -131,7 +147,7 @@
   function flushWatchTime() {
     if (accumulatedSeconds < 1) return;
     const minutes = accumulatedSeconds / 60;
-    chrome.runtime.sendMessage({ type: 'TRACK_WATCH_TIME', minutes }).catch(() => {});
+    safeSend({ type: 'TRACK_WATCH_TIME', minutes });
     accumulatedSeconds = 0;
   }
 
@@ -204,14 +220,14 @@
     const uploadDate = extractUploadDate();
 
     if (duration || title || channel || uploadDate) {
-      chrome.runtime.sendMessage({
+      safeSend({
         type: 'VIDEO_METADATA',
         videoId,
         duration: duration || undefined,
         title: title || undefined,
         channel: channel || undefined,
         uploadDate: uploadDate || undefined,
-      }).catch(() => {});
+      });
     }
   }
 
@@ -275,7 +291,7 @@
 
   async function getSettings() {
     try {
-      return await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' });
+      return await safeSend({ type: 'GET_SETTINGS' });
     } catch { return {}; }
   }
 
@@ -373,14 +389,47 @@
       const style = document.createElement('style');
       style.id = YTM_STYLE_ID;
       style.textContent = `
-        /* Hide all recommendation containers */
+        /* Hide the entire secondary column (recommendations sidebar) */
+        #secondary.ytd-watch-flexy:not(.ytm-comments-sidebar) {
+          display: none !important;
+        }
+
+        /* Hide recommendation items even when comments are in sidebar */
         ytd-watch-next-secondary-results-renderer,
-        #related.ytd-watch-flexy,
         #items.ytd-watch-next-secondary-results-renderer {
           display: none !important;
         }
 
-        /* When comments are in the sidebar, style the secondary column */
+        /* Expand the primary content to fill the full width */
+        ytd-watch-flexy:not([theater]):not([fullscreen]) #primary.ytd-watch-flexy {
+          max-width: 100% !important;
+          flex: 1 1 100% !important;
+        }
+
+        ytd-watch-flexy:not([theater]):not([fullscreen]) #primary-inner.ytd-watch-flexy {
+          max-width: 100% !important;
+        }
+
+        /* Let the video player expand */
+        ytd-watch-flexy:not([theater]):not([fullscreen]) #player-container-outer {
+          max-width: 100% !important;
+        }
+
+        /* Expand the below-player content (title, actions, description, comments) */
+        ytd-watch-flexy:not([theater]):not([fullscreen]) #below.ytd-watch-flexy {
+          max-width: 100% !important;
+        }
+
+        ytd-watch-flexy:not([theater]):not([fullscreen]) ytd-watch-metadata {
+          max-width: 100% !important;
+        }
+
+        /* Remove the columns flex container min-width constraint */
+        ytd-watch-flexy:not([theater]):not([fullscreen]) #columns.ytd-watch-flexy {
+          max-width: 100% !important;
+        }
+
+        /* When comments are in the sidebar, show the secondary column */
         #secondary.ytd-watch-flexy.ytm-comments-sidebar {
           display: block !important;
         }
@@ -470,9 +519,120 @@
     originalCommentsNextSibling = null;
   }
 
+  // --- Thumbnail Indicators (show which videos are in the queue) ---
+
+  const YTM_INDICATOR_STYLE_ID = 'ytm-indicator-style';
+  let knownQueuedIds = new Set();
+  let knownWatchedIds = new Set();
+
+  function injectIndicatorStyles() {
+    if (document.getElementById(YTM_INDICATOR_STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = YTM_INDICATOR_STYLE_ID;
+    style.textContent = `
+      .ytm-status-badge {
+        position: absolute !important;
+        top: 4px !important;
+        left: 4px !important;
+        width: 18px !important;
+        height: 18px !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        color: #fff !important;
+        font-size: 11px !important;
+        font-weight: 700 !important;
+        border-radius: 3px !important;
+        z-index: 2000 !important;
+        pointer-events: none !important;
+        font-family: Roboto, Arial, sans-serif !important;
+        line-height: 1 !important;
+      }
+      .ytm-status-badge--queued {
+        background: rgba(255, 0, 0, 0.9) !important;
+      }
+      .ytm-status-badge--watched {
+        background: rgba(43, 166, 64, 0.9) !important;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  async function refreshQueuedIds() {
+    try {
+      const r = await safeSend({ type: 'GET_QUEUED_IDS' });
+      knownQueuedIds = new Set(r.ids || []);
+      knownWatchedIds = new Set(r.watched || []);
+    } catch {}
+  }
+
+  function extractVideoIdFromHref(href) {
+    if (!href || href === '#') return null;
+    const m = href.match(/\/watch\?v=([a-zA-Z0-9_-]{11})/) || href.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
+    return m ? m[1] : null;
+  }
+
+  function applyThumbnailIndicators() {
+    // Find all video thumbnail anchors — supports both old and new YouTube layouts
+    const anchors = document.querySelectorAll(
+      'a.yt-lockup-view-model__content-image, ' + // new layout (2024+)
+      'a#thumbnail[href]'                          // old layout
+    );
+    for (const link of anchors) {
+      const videoId = extractVideoIdFromHref(link.getAttribute('href'));
+      if (!videoId) continue;
+
+      // Find the best positioned parent for badge placement
+      let container = link;
+      let el = link.parentElement;
+      for (let i = 0; i < 4 && el; i++) {
+        if (getComputedStyle(el).position !== 'static') { container = el; break; }
+        el = el.parentElement;
+      }
+
+      const existing = container.querySelector('.ytm-status-badge');
+      const isQueued = knownQueuedIds.has(videoId);
+      const isWatched = knownWatchedIds.has(videoId);
+
+      if (isQueued || isWatched) {
+        const wantClass = isQueued ? 'ytm-status-badge--queued' : 'ytm-status-badge--watched';
+        const wantText = isQueued ? 'Q' : 'W';
+        if (existing) {
+          // Update if state changed (e.g. queued → watched)
+          if (!existing.classList.contains(wantClass)) {
+            existing.className = 'ytm-status-badge ' + wantClass;
+            existing.textContent = wantText;
+          }
+        } else {
+          const badge = document.createElement('span');
+          badge.className = 'ytm-status-badge ' + wantClass;
+          badge.textContent = wantText;
+          container.appendChild(badge);
+        }
+      } else {
+        if (existing) existing.remove();
+      }
+    }
+  }
+
+  // --- Ctrl+Middle-Click Detection (star tag) ---
+
+  document.addEventListener('auxclick', (e) => {
+    if (e.button !== 1 || !e.ctrlKey) return;
+    const link = e.target.closest('a[href]');
+    if (!link) return;
+    const videoId = extractVideoIdFromHref(link.getAttribute('href'));
+    if (!videoId) return;
+    const href = link.getAttribute('href');
+    const fullUrl = href.startsWith('http') ? href : 'https://www.youtube.com' + href;
+    safeSend({ type: 'TAG_STARRED', videoId, url: fullUrl });
+  }, true);
+
   // --- Initialization ---
 
   function init() {
+    injectIndicatorStyles();
+    refreshQueuedIds().then(applyThumbnailIndicators);
     const video = getVideoElement();
     if (video) {
       startTracking();
@@ -510,15 +670,14 @@
 
   window.addEventListener('beforeunload', flushWatchTime);
 
-  // Re-apply YouTube UI modifications periodically
-  // (YouTube lazy-loads content, and theater mode can toggle)
+  // Re-apply YouTube UI modifications and thumbnail indicators periodically
   setInterval(async () => {
+    if (!isContextValid()) return;
     try {
       const s = await getSettings();
-      if (s.hideRecs) {
-        applyHideRecs(true);
-      }
+      if (s && s.hideRecs) applyHideRecs(true);
     } catch {}
+    refreshQueuedIds().then(applyThumbnailIndicators);
   }, 3000);
 
   init();
