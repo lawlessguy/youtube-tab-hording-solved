@@ -10,6 +10,14 @@ let nowPlayingVideoId = null;
 let lastMediaState = null;
 let cachedVideos = [];
 
+// Virtual scroll data — full sorted arrays (not rendered to DOM)
+let dataVideos = [];
+let dataShorts = [];
+let dataWatched = [];
+const CARD_HEIGHT = 63; // Approximate card height including gap
+const RENDER_BUFFER = 8; // Extra cards above/below viewport
+let lastRenderKey = ''; // Track what's rendered to avoid redundant redraws
+
 // --- Helpers ---
 function fmt(min) {
   if (min < 60) return Math.round(min) + 'm';
@@ -116,37 +124,124 @@ async function loadVideos() {
       );
     }
 
-    // Filter out the now-playing video from the regular list
     const regular = filtered.filter(v => !v.isShort && v.id !== nowPlayingVideoId);
     const shorts = filtered.filter(v => v.isShort && v.id !== nowPlayingVideoId);
 
-    document.getElementById('video-count').textContent = regular.length;
-    document.getElementById('shorts-count').textContent = shorts.length;
-    document.getElementById('watched-count').textContent = watched.length;
+    // Store sorted data for virtual scroll rendering
+    dataVideos = sortVids(regular);
+    dataShorts = sortVids(shorts);
+    dataWatched = sortVids(watched);
 
-    renderVideoList('video-list', sortVids(regular), null, false);
-    renderVideoList('shorts-list', sortVids(shorts), null, false);
-    renderVideoList('watched-list', sortVids(watched), null, true);
+    document.getElementById('video-count').textContent = dataVideos.length;
+    document.getElementById('shorts-count').textContent = dataShorts.length;
+    document.getElementById('watched-count').textContent = dataWatched.length;
+
+    // Set container heights for virtual scroll
+    setVirtualHeight('video-list', dataVideos.length);
+    setVirtualHeight('shorts-list', dataShorts.length);
+    setVirtualHeight('watched-list', dataWatched.length);
 
     document.getElementById('video-list').style.display = activeTab === 'videos' ? '' : 'none';
     document.getElementById('shorts-list').style.display = activeTab === 'shorts' ? '' : 'none';
 
     applyCollapsed('watched-list', '#watched-header .collapse-icon', watchedCollapsed);
     storeVisibleVideoOrder();
+
+    // Force re-render of visible cards
+    lastRenderKey = '';
+    renderVisibleCards();
   } catch (e) { console.error('Videos error:', e); }
 }
 
-// Returns the ordered list of video IDs as currently visible in the side panel
+// Returns the ordered list of ALL video IDs in the active tab's data (not just DOM)
 function getVisibleVideoOrder() {
-  const listId = activeTab === 'videos' ? 'video-list' : 'shorts-list';
-  return [...document.querySelectorAll('#' + listId + ' .video-item')]
-    .map(item => item.dataset.id).filter(Boolean);
+  const data = activeTab === 'videos' ? dataVideos : dataShorts;
+  return data.map(v => v.id);
 }
 
-// Persist the visible order to storage so auto-play (VIDEO_ENDED) can use it
 function storeVisibleVideoOrder() {
-  const order = getVisibleVideoOrder();
-  chrome.storage.local.set({ yt_next_video_order: order });
+  chrome.storage.local.set({ yt_next_video_order: getVisibleVideoOrder() });
+}
+
+// --- Virtual Scroll ---
+function setVirtualHeight(containerId, count) {
+  const container = document.getElementById(containerId);
+  if (count === 0) {
+    container.style.height = '';
+    container.style.position = '';
+    return;
+  }
+  container.style.height = (count * CARD_HEIGHT) + 'px';
+  container.style.position = 'relative';
+}
+
+function renderVisibleCards() {
+  const scrollArea = document.querySelector('.scroll-area');
+  const scrollTop = scrollArea.scrollTop;
+  const viewportHeight = scrollArea.clientHeight;
+
+  // Render the active video/shorts list
+  renderVirtualList(
+    activeTab === 'videos' ? 'video-list' : 'shorts-list',
+    activeTab === 'videos' ? dataVideos : dataShorts,
+    false
+  );
+
+  // Render watched list if visible
+  if (!watchedCollapsed) {
+    renderVirtualList('watched-list', dataWatched, true);
+  }
+}
+
+function renderVirtualList(containerId, data, isWatched) {
+  const container = document.getElementById(containerId);
+  if (container.classList.contains('collapsed')) return;
+
+  if (!data.length) {
+    const key = containerId + ':empty';
+    if (lastRenderKey === key) return;
+    container.textContent = '';
+    container.style.height = '';
+    container.style.position = '';
+    container.appendChild(el('div', { class: 'empty-state', text: isWatched ? 'No watched videos' : 'No videos' }));
+    if (containerId === (activeTab === 'videos' ? 'video-list' : 'shorts-list')) lastRenderKey = key;
+    return;
+  }
+
+  const scrollArea = document.querySelector('.scroll-area');
+  const scrollTop = scrollArea.scrollTop;
+  const viewportHeight = scrollArea.clientHeight;
+  const containerTop = container.offsetTop;
+  const relScroll = scrollTop - containerTop;
+
+  const startIdx = Math.max(0, Math.floor(relScroll / CARD_HEIGHT) - RENDER_BUFFER);
+  const endIdx = Math.min(data.length, Math.ceil((relScroll + viewportHeight) / CARD_HEIGHT) + RENDER_BUFFER);
+
+  // Skip if same range is already rendered
+  const key = containerId + ':' + startIdx + ':' + endIdx;
+  if (key === lastRenderKey && containerId === (activeTab === 'videos' ? 'video-list' : 'shorts-list')) return;
+  if (containerId === (activeTab === 'videos' ? 'video-list' : 'shorts-list')) lastRenderKey = key;
+
+  container.textContent = '';
+  container.style.height = (data.length * CARD_HEIGHT) + 'px';
+  container.style.position = 'relative';
+
+  // Top spacer
+  if (startIdx > 0) {
+    container.appendChild(el('div', { style: { height: (startIdx * CARD_HEIGHT) + 'px', flexShrink: '0' } }));
+  }
+
+  // Render visible cards
+  for (let i = startIdx; i < endIdx; i++) {
+    container.appendChild(buildVideoItem(data[i], null, isWatched));
+  }
+
+  // Bottom spacer
+  if (endIdx < data.length) {
+    container.appendChild(el('div', { style: { height: ((data.length - endIdx) * CARD_HEIGHT) + 'px', flexShrink: '0' } }));
+  }
+
+  if (!isWatched && endIdx - startIdx > 0) setupDragDrop(container);
 }
 
 function applyCollapsed(listId, iconSel, isCollapsed) {
@@ -248,18 +343,7 @@ function buildVideoItem(v, _unused, isWatched) {
   return item;
 }
 
-function renderVideoList(containerId, videos, categories, isWatched) {
-  const container = document.getElementById(containerId);
-  const wasCollapsed = container.classList.contains('collapsed');
-  container.textContent = '';
-  if (!videos.length) {
-    container.appendChild(el('div', { class: 'empty-state', text: isWatched ? 'No watched videos' : 'No videos' }));
-  } else {
-    videos.forEach(v => container.appendChild(buildVideoItem(v, categories, isWatched)));
-    if (!isWatched) setupDragDrop(container);
-  }
-  if (wasCollapsed) container.classList.add('collapsed');
-}
+// renderVideoList removed — replaced by virtual scroll (renderVirtualList)
 
 // --- Now Playing (Active Video Priority Slot) ---
 function buildNowPlayingCard(video, state) {
@@ -405,6 +489,8 @@ document.querySelectorAll('.content-tab').forEach(tab => {
     activeTab = tab.dataset.tab;
     document.getElementById('video-list').style.display = activeTab === 'videos' ? '' : 'none';
     document.getElementById('shorts-list').style.display = activeTab === 'shorts' ? '' : 'none';
+    lastRenderKey = '';
+    renderVisibleCards();
     storeVisibleVideoOrder();
   });
 });
@@ -413,6 +499,7 @@ document.querySelectorAll('.content-tab').forEach(tab => {
 document.getElementById('watched-header').addEventListener('click', () => {
   watchedCollapsed = !watchedCollapsed;
   applyCollapsed('watched-list', '#watched-header .collapse-icon', watchedCollapsed);
+  if (!watchedCollapsed) renderVisibleCards();
 });
 
 // --- Toggle Icon Bar ---
@@ -572,11 +659,8 @@ document.getElementById('collect-tabs').addEventListener('click', async () => {
 });
 
 document.getElementById('close-tabs').addEventListener('click', async () => {
-  // Close tabs matching videos in BOTH the videos and shorts lists
-  const videoIds = [
-    ...document.querySelectorAll('#video-list .video-item'),
-    ...document.querySelectorAll('#shorts-list .video-item'),
-  ].map(item => item.dataset.id).filter(Boolean);
+  // Close tabs matching videos in BOTH the videos and shorts data arrays
+  const videoIds = [...dataVideos, ...dataShorts].map(v => v.id);
   if (videoIds.length > 0) {
     await msg({ type: 'CLOSE_VISIBLE_TABS', videoIds });
   }
@@ -621,6 +705,18 @@ document.getElementById('refresh-metadata').addEventListener('click', async () =
 
 // Background updates
 chrome.runtime.onMessage.addListener(m => { if (m.type === 'VIDEOS_UPDATED') loadVideos(); });
+
+// --- Virtual Scroll Listener ---
+let scrollRafPending = false;
+document.querySelector('.scroll-area').addEventListener('scroll', () => {
+  if (!scrollRafPending) {
+    scrollRafPending = true;
+    requestAnimationFrame(() => {
+      renderVisibleCards();
+      scrollRafPending = false;
+    });
+  }
+});
 
 // --- Init ---
 loadWatchTime();

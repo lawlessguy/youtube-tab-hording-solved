@@ -504,18 +504,22 @@ header {
 .video-list.collapsed { display: none; }
 
 /* Video Cards */
-.video-list { display: flex; flex-direction: column; gap: 4px; }
+.video-list { display: flex; flex-direction: column; gap: 0; overflow: hidden; }
 
 .video-item {
   display: flex;
   gap: 8px;
   padding: 6px;
+  margin-bottom: 4px;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--r);
   cursor: grab;
   transition: all 0.15s;
   position: relative;
+  flex-shrink: 0;
+  height: 59px;
+  box-sizing: border-box;
 }
 
 .video-item:hover { background: var(--bg-hover); border-color: #3a3a3a; }
@@ -536,7 +540,7 @@ header {
 
 .video-title {
   font-size: 12px; font-weight: 500; line-height: 1.3;
-  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
 .video-meta { font-size: 10px; color: var(--text2); display: flex; gap: 5px; align-items: center; flex-wrap: wrap; }
