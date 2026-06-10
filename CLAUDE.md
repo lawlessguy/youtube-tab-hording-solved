@@ -84,3 +84,19 @@ New YouTube tabs are caught via `chrome.tabs.onCreated` + `chrome.tabs.onUpdated
 - Re-opening a video already in the queue updates its `addedAt` to current time (bumps to top of "Added" sort)
 - Every tab-closing path (`CLOSE_SHORTS_TABS`, `CLOSE_VISIBLE_TABS`, `REMOVE_DUPLICATES`, intercept 'close') preserves the active tab — never close what the user is watching
 - PowerShell 5.1 `Get-Content`/`Set-Content` mangles this repo's UTF-8 files (em-dashes/arrows become mojibake) — use proper editing tools, not shell pipelines, for source edits
+
+<!-- progress-journal -->
+## Progress Journal (PROGRESS.md)
+
+This project keeps a development journal in `PROGRESS.md` at the project root.
+
+- **At the start of every session:** read the **Current State** section of
+  `PROGRESS.md` before doing anything else. Do not read the full journal unless
+  a question about project history comes up.
+- **At the end of every working session** (or when the user says they're done,
+  or before compacting/ending): append one dated entry to the top of the
+  **Journal** section (newest first) covering what was done, decisions made,
+  and what's next — then rewrite **Current State** to reflect the new reality.
+- Journal entries are append-only; never edit or delete past entries.
+- Keep Current State under ~25 lines. It must let a fresh session get oriented
+  in under a minute.
