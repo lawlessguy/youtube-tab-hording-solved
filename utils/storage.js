@@ -11,9 +11,22 @@ export async function getMultiple(keys) {
   return chrome.storage.local.get(keys);
 }
 
-export async function update(key, updateFn) {
-  const current = await get(key);
-  const updated = updateFn(current);
-  await set(key, updated);
-  return updated;
+// All storage writes are read-modify-write: two concurrent mutations that
+// read the same snapshot silently revert each other (duplicate queue entries,
+// lost watch flags). Every mutation must go through update(), which chains
+// them on one queue. Keep slow work (network fetches) OUTSIDE updateFn.
+// Returning undefined from updateFn skips the write.
+let writeQueue = Promise.resolve();
+
+export function update(key, updateFn) {
+  const run = writeQueue.then(async () => {
+    const current = await get(key);
+    const updated = await updateFn(current);
+    if (updated !== undefined) {
+      await set(key, updated);
+    }
+    return updated;
+  });
+  writeQueue = run.then(() => {}, () => {});
+  return run;
 }

@@ -105,16 +105,16 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // --- Silent Background Logging ---
 
 async function logVideoSilently(url, videoId, starred) {
-  const logged = await storage.get(STORAGE_KEYS.LOGGED_VIDEOS) || [];
-  const existing = logged.find(v => v.id === videoId);
-  if (existing) {
-    existing.timestamp = Date.now();
-    if (starred) existing.starred = true; // never unstar
-    await storage.set(STORAGE_KEYS.LOGGED_VIDEOS, logged);
-    return;
-  }
-  logged.push({ id: videoId, url, isShort: isShortUrl(url), timestamp: Date.now(), starred: !!starred });
-  await storage.set(STORAGE_KEYS.LOGGED_VIDEOS, logged);
+  await storage.update(STORAGE_KEYS.LOGGED_VIDEOS, (logged = []) => {
+    const existing = logged.find(v => v.id === videoId);
+    if (existing) {
+      existing.timestamp = Date.now();
+      if (starred) existing.starred = true; // never unstar
+      return logged;
+    }
+    logged.push({ id: videoId, url, isShort: isShortUrl(url), timestamp: Date.now(), starred: !!starred });
+    return logged;
+  });
 }
 
 // --- Video Queue ---
@@ -123,58 +123,65 @@ async function addVideoToQueue(url, videoId, explicitTimestamp, starred) {
   videoId = videoId || extractVideoId(url);
   if (!videoId) return null;
 
-  const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
-  const existing = videos.find(v => v.id === videoId);
-  if (existing) {
-    existing.addedAt = explicitTimestamp || Date.now();
-    if (starred) existing.starred = true;
-    await storage.set(STORAGE_KEYS.VIDEOS, videos);
-    broadcast({ type: MSG.VIDEOS_UPDATED });
-    return null;
+  // Insert a placeholder atomically (no network inside the storage lock),
+  // then fill in metadata in the background. Two simultaneous adds of the
+  // same video can no longer both pass the duplicate check.
+  let inserted = null;
+  await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
+    const existing = videos.find(v => v.id === videoId);
+    if (existing) {
+      existing.addedAt = explicitTimestamp || Date.now();
+      if (starred) existing.starred = true;
+      return videos;
+    }
+    inserted = {
+      id: videoId,
+      url,
+      title: 'Loading...',
+      channel: 'Unknown',
+      thumbnail: getThumbnailUrl(videoId),
+      duration: 0,
+      addedAt: explicitTimestamp || Date.now(),
+      uploadedAt: null,
+      isShort: isShortUrl(url),
+      category: 'Uncategorized',
+      watched: false,
+      starred: !!starred,
+    };
+    videos.push(inserted);
+    return videos;
+  });
+
+  broadcast({ type: MSG.VIDEOS_UPDATED });
+
+  if (inserted) {
+    // Fetch title, channel, duration & upload date in background (non-blocking)
+    enrichVideo(videoId);
+    // Auto-categorize if AI is configured and user has custom categories
+    autoCategorizeSingle(videoId);
   }
 
-  const isShort = isShortUrl(url);
-  const metadata = await fetchVideoMetadata(videoId);
-
-  const video = {
-    id: videoId,
-    url,
-    title: metadata?.title || 'Loading...',
-    channel: metadata?.channel || 'Unknown',
-    thumbnail: getThumbnailUrl(videoId),
-    duration: 0,
-    addedAt: explicitTimestamp || Date.now(),
-    uploadedAt: null,
-    isShort,
-    category: 'Uncategorized',
-    watched: false,
-    starred: !!starred,
-    order: videos.length,
-  };
-
-  videos.push(video);
-  await storage.set(STORAGE_KEYS.VIDEOS, videos);
-
-  // Fetch duration & upload date in background (non-blocking)
-  fetchAndUpdateDetails(videoId);
-
-  // Auto-categorize if AI is configured and user has custom categories
-  autoCategorizeSingle(videoId);
-
-  return video;
+  return inserted;
 }
 
-async function fetchAndUpdateDetails(videoId) {
+async function enrichVideo(videoId) {
   try {
-    const details = await fetchVideoDetails(videoId);
-    const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
-    const idx = videos.findIndex(v => v.id === videoId);
-    if (idx !== -1) {
-      if (details.duration) videos[idx].duration = details.duration;
-      if (details.uploadDate) videos[idx].uploadedAt = details.uploadDate;
-      await storage.set(STORAGE_KEYS.VIDEOS, videos);
-      broadcast({ type: MSG.VIDEOS_UPDATED });
-    }
+    const [metadata, details] = await Promise.all([
+      fetchVideoMetadata(videoId),
+      fetchVideoDetails(videoId),
+    ]);
+    let found = false;
+    await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
+      const video = videos.find(v => v.id === videoId);
+      if (!video) return undefined; // removed in the meantime — skip write
+      found = true;
+      if (metadata?.title) video.title = metadata.title;
+      if (metadata?.channel) video.channel = metadata.channel;
+      if (details.duration) video.duration = details.duration;
+      if (details.uploadDate) video.uploadedAt = details.uploadDate;
+      return videos;
+    });
+    if (found) broadcast({ type: MSG.VIDEOS_UPDATED });
   } catch (e) {
     console.error('Failed to fetch video details:', e);
   }
@@ -406,23 +413,23 @@ async function handleMessage(message, sender) {
     }
 
     case MSG.REMOVE_VIDEO: {
-      const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
-      await storage.set(STORAGE_KEYS.VIDEOS, videos.filter(v => v.id !== message.videoId));
+      await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) =>
+        videos.filter(v => v.id !== message.videoId));
       return { success: true };
     }
 
     case MSG.UPDATE_VIDEO: {
-      const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
-      const idx = videos.findIndex(v => v.id === message.videoId);
-      if (idx !== -1) {
-        Object.assign(videos[idx], message.updates);
-        await storage.set(STORAGE_KEYS.VIDEOS, videos);
-      }
+      await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
+        const video = videos.find(v => v.id === message.videoId);
+        if (!video) return undefined;
+        Object.assign(video, message.updates);
+        return videos;
+      });
       return { success: true };
     }
 
     case MSG.SET_VIDEOS: {
-      await storage.set(STORAGE_KEYS.VIDEOS, message.videos);
+      await storage.update(STORAGE_KEYS.VIDEOS, () => message.videos);
       return { success: true };
     }
 
@@ -443,13 +450,17 @@ async function handleMessage(message, sender) {
         }
       }
 
-      // Also pull from silently logged videos (carry starred flag)
-      const logged = await storage.get(STORAGE_KEYS.LOGGED_VIDEOS) || [];
-      for (const entry of logged) {
+      // Also pull from silently logged videos (carry starred flag). Drain
+      // atomically so entries logged while we queue them aren't lost.
+      let drained = [];
+      await storage.update(STORAGE_KEYS.LOGGED_VIDEOS, (logged = []) => {
+        drained = logged;
+        return [];
+      });
+      for (const entry of drained) {
         const video = await addVideoToQueue(entry.url, entry.id, entry.timestamp, entry.starred);
         if (video) added++;
       }
-      await storage.set(STORAGE_KEYS.LOGGED_VIDEOS, []);
 
       return { added, tabIds: ytTabs.map(t => t.id) };
     }
@@ -495,17 +506,19 @@ async function handleMessage(message, sender) {
     }
 
     case MSG.SET_VOLUME: {
-      const settings = await storage.get(STORAGE_KEYS.SETTINGS) || DEFAULT_SETTINGS;
-      settings.volumeLevel = message.value;
-      await storage.set(STORAGE_KEYS.SETTINGS, settings);
+      const settings = await storage.update(STORAGE_KEYS.SETTINGS, (s = { ...DEFAULT_SETTINGS }) => {
+        s.volumeLevel = message.value;
+        return s;
+      });
       await applyMediaControl('volume', message.value, message.scope || settings.volumeScope);
       return { success: true };
     }
 
     case MSG.SET_SPEED: {
-      const settings = await storage.get(STORAGE_KEYS.SETTINGS) || DEFAULT_SETTINGS;
-      settings.speedLevel = message.value;
-      await storage.set(STORAGE_KEYS.SETTINGS, settings);
+      const settings = await storage.update(STORAGE_KEYS.SETTINGS, (s = { ...DEFAULT_SETTINGS }) => {
+        s.speedLevel = message.value;
+        return s;
+      });
       await applyMediaControl('speed', message.value, message.scope || settings.speedScope);
       return { success: true };
     }
@@ -514,17 +527,16 @@ async function handleMessage(message, sender) {
       return await storage.get(STORAGE_KEYS.SETTINGS) || DEFAULT_SETTINGS;
 
     case MSG.UPDATE_SETTINGS: {
-      const current = await storage.get(STORAGE_KEYS.SETTINGS) || DEFAULT_SETTINGS;
-      const updated = { ...current, ...message.settings };
-      await storage.set(STORAGE_KEYS.SETTINGS, updated);
-      return updated;
+      return await storage.update(STORAGE_KEYS.SETTINGS, (current = DEFAULT_SETTINGS) =>
+        ({ ...current, ...message.settings }));
     }
 
     case MSG.TRACK_WATCH_TIME: {
-      const watchTime = await storage.get(STORAGE_KEYS.WATCH_TIME) || {};
-      const todayKey = getDateKey(new Date());
-      watchTime[todayKey] = (watchTime[todayKey] || 0) + message.minutes;
-      await storage.set(STORAGE_KEYS.WATCH_TIME, watchTime);
+      await storage.update(STORAGE_KEYS.WATCH_TIME, (watchTime = {}) => {
+        const todayKey = getDateKey(new Date());
+        watchTime[todayKey] = (watchTime[todayKey] || 0) + message.minutes;
+        return watchTime;
+      });
       return { success: true };
     }
 
@@ -533,15 +545,15 @@ async function handleMessage(message, sender) {
 
     case MSG.VIDEO_METADATA: {
       const { videoId, duration, title, channel, uploadDate } = message;
-      const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
-      const idx = videos.findIndex(v => v.id === videoId);
-      if (idx !== -1) {
-        if (duration) videos[idx].duration = duration;
-        if (title) videos[idx].title = title;
-        if (channel) videos[idx].channel = channel;
-        if (uploadDate) videos[idx].uploadedAt = uploadDate;
-        await storage.set(STORAGE_KEYS.VIDEOS, videos);
-      }
+      await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
+        const video = videos.find(v => v.id === videoId);
+        if (!video) return undefined;
+        if (duration) video.duration = duration;
+        if (title) video.title = title;
+        if (channel) video.channel = channel;
+        if (uploadDate) video.uploadedAt = uploadDate;
+        return videos;
+      });
       return { success: true };
     }
 
@@ -657,26 +669,34 @@ async function handleMessage(message, sender) {
     }
 
     case 'REFRESH_METADATA': {
-      // Re-fetch ALL video details, overwriting any drag-modified values
+      // Re-fetch ALL video details, overwriting any drag-modified values.
+      // Fetch outside the storage lock, then apply to a fresh snapshot in one
+      // atomic update — a long refresh must not revert removes/mark-watched
+      // that happen while it runs.
       const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
-      let refreshed = 0;
+      const fetched = new Map();
       for (const video of videos) {
         try {
           const details = await fetchVideoDetails(video.id);
           const meta = await fetchVideoMetadata(video.id);
-          const idx = videos.findIndex(v => v.id === video.id);
-          if (idx !== -1) {
-            if (details.duration) videos[idx].duration = details.duration;
-            if (details.uploadDate) videos[idx].uploadedAt = details.uploadDate;
-            if (meta?.title) videos[idx].title = meta.title;
-            if (meta?.channel) videos[idx].channel = meta.channel;
-            refreshed++;
-          }
+          fetched.set(video.id, { details, meta });
         } catch (e) {
           console.error('Refresh failed for', video.id, e);
         }
       }
-      await storage.set(STORAGE_KEYS.VIDEOS, videos);
+      let refreshed = 0;
+      await storage.update(STORAGE_KEYS.VIDEOS, (fresh = []) => {
+        for (const video of fresh) {
+          const r = fetched.get(video.id);
+          if (!r) continue;
+          if (r.details.duration) video.duration = r.details.duration;
+          if (r.details.uploadDate) video.uploadedAt = r.details.uploadDate;
+          if (r.meta?.title) video.title = r.meta.title;
+          if (r.meta?.channel) video.channel = r.meta.channel;
+          refreshed++;
+        }
+        return fresh;
+      });
       broadcast({ type: MSG.VIDEOS_UPDATED });
       return { refreshed };
     }
@@ -708,24 +728,29 @@ async function handleMessage(message, sender) {
       const vid = message.videoId;
       if (!vid) return { success: false };
       // Check queue first
-      const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
-      const qv = videos.find(v => v.id === vid);
-      if (qv) {
+      let inQueue = false;
+      await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
+        const qv = videos.find(v => v.id === vid);
+        if (!qv) return undefined;
+        inQueue = true;
         qv.starred = true;
-        await storage.set(STORAGE_KEYS.VIDEOS, videos);
+        return videos;
+      });
+      if (inQueue) {
         broadcast({ type: MSG.VIDEOS_UPDATED });
         return { success: true };
       }
       // Check logged videos
-      const logged = await storage.get(STORAGE_KEYS.LOGGED_VIDEOS) || [];
-      const lv = logged.find(v => v.id === vid);
-      if (lv) {
+      let inLog = false;
+      await storage.update(STORAGE_KEYS.LOGGED_VIDEOS, (logged = []) => {
+        const lv = logged.find(v => v.id === vid);
+        if (!lv) return undefined;
+        inLog = true;
         lv.starred = true;
-        await storage.set(STORAGE_KEYS.LOGGED_VIDEOS, logged);
-        return { success: true };
-      }
+        return logged;
+      });
       // Not found anywhere — log it as starred
-      if (message.url) {
+      if (!inLog && message.url) {
         await logVideoSilently(message.url, vid, true);
       }
       return { success: true };
@@ -765,17 +790,20 @@ async function handleMessage(message, sender) {
 
     case MSG.SKIP_VIDEO: {
       const currentVideoId = message.videoId;
-      const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
 
       // Mark current as watched if it's in the queue
-      if (currentVideoId) {
-        const idx = videos.findIndex(v => v.id === currentVideoId);
-        if (idx !== -1) {
-          videos[idx].watched = true;
-          await storage.set(STORAGE_KEYS.VIDEOS, videos);
-          broadcast({ type: MSG.VIDEOS_UPDATED });
+      let marked = false;
+      const videos = await storage.update(STORAGE_KEYS.VIDEOS, (vids = []) => {
+        if (currentVideoId) {
+          const video = vids.find(v => v.id === currentVideoId);
+          if (video && !video.watched) {
+            video.watched = true;
+            marked = true;
+          }
         }
-      }
+        return vids;
+      });
+      if (marked) broadcast({ type: MSG.VIDEOS_UPDATED });
 
       // Use the ordered next-video list from the side panel if provided
       let nextVideo = null;
@@ -811,13 +839,15 @@ async function handleMessage(message, sender) {
     }
 
     case MSG.MARK_WATCHED: {
-      const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
-      const idx = videos.findIndex(v => v.id === message.videoId);
-      if (idx !== -1 && !videos[idx].watched) {
-        videos[idx].watched = true;
-        await storage.set(STORAGE_KEYS.VIDEOS, videos);
-        broadcast({ type: MSG.VIDEOS_UPDATED });
-      }
+      let changed = false;
+      await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
+        const video = videos.find(v => v.id === message.videoId);
+        if (!video || video.watched) return undefined;
+        video.watched = true;
+        changed = true;
+        return videos;
+      });
+      if (changed) broadcast({ type: MSG.VIDEOS_UPDATED });
       return { success: true };
     }
 
