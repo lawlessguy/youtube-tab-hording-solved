@@ -28,6 +28,7 @@ let suggestScores = { channels: {} };
 let lastScoreFetch = 0;
 // Shorts (stage 07): in-panel embed player + tools-strip toggle state
 let shortsPlayerVideoId = null;
+let spEndedHandledId = null; // once-per-open guard: onStateChange AND infoDelivery may both report 'ended'
 const embedCache = new Map(); // videoId -> embeddable boolean (per panel session)
 let panelSettings = {};       // mirror of yt_settings for the shorts toggles
 
@@ -419,14 +420,16 @@ function buildVideoItem(v, _unused, isWatched) {
       class: 'thumb-tab-badge', text: 'TAB', title: 'Open in a Chrome tab',
     }));
   }
-  // Add/move count chip (top-right) -- hidden while < 2 (every video was
-  // added once); legacy videos without the field count as 1
+  // Add count chip (top-right) -- hidden while < 2 (every video was added
+  // once); legacy videos without the field count as 1. Counts re-add /
+  // re-open / intercept bumps only \u2014 drag-to-top deliberately does NOT
+  // increment (plan 05 Q4 lead decision), so the tooltip says "added".
   const addCount = v.addCount || 1;
   if (addCount >= 2) {
     thumbWrap.appendChild(el('span', {
       class: 'thumb-addcount',
       text: (addCount > 9 ? '9+' : addCount) + '\u00D7',
-      title: 'Added or moved to top ' + addCount + ' times',
+      title: 'Added ' + addCount + ' times',
     }));
   }
 
@@ -910,6 +913,7 @@ function checkEmbeddable(videoId) {
 
 async function openShortsPlayer(videoId) {
   shortsPlayerVideoId = videoId;
+  spEndedHandledId = null;
   const container = document.getElementById('shorts-player');
   const known = cachedVideos.find(v => v.id === videoId);
   const title = known?.title || 'Short';
@@ -924,17 +928,25 @@ async function openShortsPlayer(videoId) {
 
   const frameWrap = el('div', { class: 'sp-frame-wrap' });
 
-  // Footer nav walks the panel's Shorts list in its current sort order
+  // Footer nav walks the panel's Shorts list in its current sort order.
+  // The open-time idx feeds only the position label / disabled states; the
+  // click handlers re-resolve against the LIVE dataShorts (it re-sorts on
+  // every VIDEOS_UPDATED, so a frozen index could navigate to the wrong card)
   const idx = dataShorts.findIndex(v => v.id === videoId);
+  const liveIdx = () => dataShorts.findIndex(v => v.id === shortsPlayerVideoId);
   const prevBtn = el('button', { class: 'np-btn', id: 'sp-prev', title: 'Previous Short in the list' });
   prevBtn.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18,15 12,9 6,15"/></svg>'; // static SVG
   prevBtn.disabled = idx <= 0;
-  prevBtn.addEventListener('click', () => { if (idx > 0) openShortsPlayer(dataShorts[idx - 1].id); });
+  prevBtn.addEventListener('click', () => {
+    const i = liveIdx();
+    if (i > 0) openShortsPlayer(dataShorts[i - 1].id);
+  });
   const nextBtn = el('button', { class: 'np-btn', id: 'sp-next', title: 'Next Short in the list' });
   nextBtn.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6,9 12,15 18,9"/></svg>'; // static SVG
   nextBtn.disabled = idx < 0 || idx >= dataShorts.length - 1;
   nextBtn.addEventListener('click', () => {
-    if (idx >= 0 && idx < dataShorts.length - 1) openShortsPlayer(dataShorts[idx + 1].id);
+    const i = liveIdx();
+    if (i >= 0 && i < dataShorts.length - 1) openShortsPlayer(dataShorts[i + 1].id);
   });
   const pos = el('span', {
     class: 'sp-pos',
@@ -971,11 +983,16 @@ async function openShortsPlayer(videoId) {
       allow: 'autoplay; encrypted-media; picture-in-picture',
     });
     // Raw jsapi handshake (the official IFrame API script can't load under
-    // the extension page CSP). Best-effort: ended-detection only.
+    // the extension page CSP). Best-effort: ended-detection only. The widget
+    // protocol does NOT emit onStateChange until the parent ALSO posts an
+    // addEventListener command — 'listening' alone yields only
+    // initialDelivery/onReady/infoDelivery (verified against a live embed).
     iframe.addEventListener('load', () => {
       try {
-        iframe.contentWindow.postMessage(
-          JSON.stringify({ event: 'listening', id: 'ytm' }), 'https://www.youtube.com');
+        const post = (m) => iframe.contentWindow.postMessage(
+          JSON.stringify(m), 'https://www.youtube.com');
+        post({ event: 'listening', id: 'ytm' });
+        post({ event: 'command', func: 'addEventListener', args: ['onStateChange'], id: 'ytm' });
       } catch {}
     });
     frameWrap.appendChild(iframe);
@@ -999,15 +1016,30 @@ function closeShortsPlayer() {
   renderVisibleCards();
 }
 
-// Embed ended-bridge: YouTube's embed posts onStateChange info 0 on 'ended'
-// after the {event:'listening'} handshake. Mark watched + advance; if the
-// protocol ever breaks, the player still works manually (fail-soft).
+// Embed ended-bridge: YouTube's embed posts onStateChange info 0 on 'ended',
+// but ONLY after the parent posts the addEventListener command (sent on
+// iframe load and re-asserted on the embed's onReady below). Belt and
+// braces: infoDelivery.playerState 0 is accepted too. Mark watched +
+// advance; if the protocol ever breaks, the player still works manually
+// (fail-soft).
 window.addEventListener('message', (e) => {
   if (e.origin !== 'https://www.youtube.com' || !shortsPlayerVideoId) return;
   let data;
   try { data = JSON.parse(e.data); } catch { return; }
-  if (data.event === 'onStateChange' && data.info === 0) { // 0 = ended
+  // Re-assert the subscription when the player announces readiness — covers
+  // embeds that finish initializing after our load-time command
+  if (data.event === 'onReady' && e.source) {
+    try {
+      e.source.postMessage(JSON.stringify({
+        event: 'command', func: 'addEventListener', args: ['onStateChange'], id: 'ytm',
+      }), 'https://www.youtube.com');
+    } catch {}
+  }
+  const ended = (data.event === 'onStateChange' && data.info === 0) || // 0 = ended
+    (data.event === 'infoDelivery' && data.info && data.info.playerState === 0);
+  if (ended && spEndedHandledId !== shortsPlayerVideoId) {
     const endedId = shortsPlayerVideoId;
+    spEndedHandledId = endedId; // both protocols may report the same end once each
     if (cachedVideos.some(v => v.id === endedId && !v.watched)) {
       msg({ type: 'UPDATE_VIDEO', videoId: endedId, sessionId: activeSessionId, updates: { watched: true } });
     }

@@ -16,6 +16,10 @@ const recentlyCreatedTabs = new Map();
 const extensionOpenedTabs = new Map();
 // Track the last tab that had a playing video (best-effort; loss is benign)
 let lastPlayingTabId = null;
+// Attention cursor for the video-attention session_switched events (plan 06
+// decision 12): the last ACTIVATED YouTube tab showing a video. Deliberately
+// not persisted — loss on worker restart costs at most one extra event.
+let lastActiveVideo = null; // { tabId, videoId }
 // Rate-limit the all-tabs media scan: the panel polls every 1.5s, and with
 // many YouTube tabs open a full scan per poll messages every one of them
 let lastFullMediaScanAt = 0;
@@ -138,6 +142,41 @@ chrome.runtime.onInstalled.addListener(async () => {
   await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
 });
 
+// --- In-panel embed Referer shim (stage 07, fix pass) ---
+// YouTube's embed player fails with "153: Video player configuration error"
+// when the HTTP Referer header is missing — and Chrome never sends a Referer
+// for documents embedded by chrome-extension:// pages, so the side panel's
+// jsapi Shorts player could not play real embeds at all (verified live).
+// A SESSION rule injects the extension's OWN origin as Referer, ONLY for
+// /embed/ sub_frames initiated by this extension; embeds on ordinary web
+// pages are untouched. The value must match the embedding ancestor origin —
+// probed empirically: ext-origin referer → plays (onStateChange:1);
+// 'https://www.youtube.com/' → error 152; absent → error 153.
+// Top-level so every worker start re-installs it (session rules don't
+// survive browser restarts). Fail-soft: without it the player degrades to
+// the existing "can't be embedded" card.
+const EMBED_REFERER_RULE_ID = 153153;
+try {
+  chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [EMBED_REFERER_RULE_ID],
+    addRules: [{
+      id: EMBED_REFERER_RULE_ID,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        requestHeaders: [
+          { header: 'Referer', operation: 'set', value: chrome.runtime.getURL('/') },
+        ],
+      },
+      condition: {
+        urlFilter: '||youtube.com/embed/',
+        resourceTypes: ['sub_frame'],
+        initiatorDomains: [chrome.runtime.id],
+      },
+    }],
+  }).catch(() => {});
+} catch {}
+
 // --- Side Panel Visibility (hide on non-YouTube tabs) ---
 
 function updateSidePanelForTab(tabId, url) {
@@ -155,6 +194,23 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
   try {
     const tab = await chrome.tabs.get(activeInfo.tabId);
     updateSidePanelForTab(tab.id, tab.url);
+    // Stage 06 (plan decision 12): focusing a YouTube tab that shows a
+    // DIFFERENT video than the last focused video tab logs the
+    // video-attention session_switched variant (videoId + fromVideoId).
+    // Coexists with the session-management variant emitted at the stage-04
+    // seams (videoId null + sessionId/fromSessionId/reason — contract ruling
+    // 4); consumers tell them apart by videoId. Non-YouTube activations
+    // neither log nor reset the cursor.
+    const vid = extractVideoId(tab.url || '');
+    if (vid && lastActiveVideo?.videoId !== vid) {
+      logActivity({
+        type: 'session_switched', videoId: vid,
+        fromVideoId: lastActiveVideo?.videoId ?? null,
+        isShort: isShortUrl(tab.url || ''),
+        source: 'browse', tabId: tab.id,
+      });
+      lastActiveVideo = { tabId: tab.id, videoId: vid };
+    }
   } catch {}
 });
 
@@ -568,9 +624,12 @@ async function handleMessage(message, sender) {
       // Capture the removed entry in the updateFn closure (no second read);
       // logActivity runs AFTER the update resolves — never inside updateFn
       let removed = null;
+      let matchedCount = 0;
       await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
         removed = videos.find(matches) || null;
-        return videos.filter(v => !matches(v));
+        const kept = videos.filter(v => !matches(v));
+        matchedCount = videos.length - kept.length;
+        return kept;
       });
       if (removed) {
         await logActivity({
@@ -580,7 +639,12 @@ async function handleMessage(message, sender) {
           source: 'manual', tabId: null,
         });
       }
-      return { success: true };
+      // Honest response on a miss (stale sessionId after a concurrent
+      // switch/merge, already-removed id) — no data hazard either way, but
+      // callers must be able to tell
+      return matchedCount > 0
+        ? { success: true, matched: matchedCount }
+        : { success: false, matched: 0 };
     }
 
     case MSG.UPDATE_VIDEO: {
@@ -607,7 +671,11 @@ async function handleMessage(message, sender) {
           source: 'manual', tabId: null,
         });
       }
-      return { success: true };
+      // Honest response on a miss (see REMOVE_VIDEO): the write was correctly
+      // skipped (updateFn returned undefined), and the caller learns it
+      return updated
+        ? { success: true, matched: 1 }
+        : { success: false, matched: 0 };
     }
 
     case MSG.SET_VIDEOS: {
@@ -1297,7 +1365,9 @@ async function handleMessage(message, sender) {
 
     case MSG.LOG_ACTIVITY_EVENT: {
       // Generic append hook for other UI surfaces/feature groups — type
-      // validated against the allowlist; tabId defaults to the sender's tab
+      // validated against the allowlist; tabId defaults to the sender's tab.
+      // No production senders yet by design (plan 06 §3.3 extension point);
+      // exercised by test-analytics.js / test-races.js — not orphaned code.
       const ev = message.event;
       if (!ev || !EVENT_TYPES.has(ev.type)) {
         return { success: false, error: 'invalid event' };

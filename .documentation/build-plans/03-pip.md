@@ -678,6 +678,12 @@ always-on-top compositing):
   natively on its own terms.
 - **Auto-entering the Document-PiP floating player on tab switch** — technically allowed
   inside the handler but rejected by design (Q2): automatic DOM surgery on YouTube is too
-  invasive for a background trigger.
+  invasive for a background trigger, and classic PiP auto-dismisses when the user returns
+  to the tab (Document PiP would linger). **Design-judgment descope, reaffirmed at the
+  fix pass:** the consequence — the transparency slider and S/M/L presets affect ONLY the
+  manually-invoked Float window, never the auto-PiP popup — is now disclosed user-facing
+  in the `#tb-autopip` data-desc and the PiP-row slider/preset tooltips. A future
+  `pipAutoMode: 'classic' | 'float'` opt-in is the named follow-up if users want the
+  styleable window on tab switch.
 - **Forcing auto-PiP for low-engagement profiles** — MEI gating is browser policy; no
   extension override exists.

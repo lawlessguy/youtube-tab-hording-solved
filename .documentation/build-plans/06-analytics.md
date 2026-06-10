@@ -79,11 +79,26 @@ Feature group: **analytics**. Target repo: YouTube Tab Manager (Chrome MV3, no b
       url: string,             // video_opened, watch_progress, added_to_queue
       secondsWatched: number,  // watch_progress — whole seconds in this flush window
       maxPercent: number|null, // watch_progress (0–100 best reached); video_completed (100)
-      fromVideoId: string|null // session_switched
+      fromVideoId: string|null,// session_switched, video-attention variant (videoId non-null)
+      sessionId: string,       // session_switched, session-management variant (videoId null)
+      fromSessionId: string,   // session_switched, session-management variant
+      reason: 'create' | 'switch' | 'delete' | 'merge' // session_switched, session-management variant
     }
   ]
 }
 ```
+
+**`session_switched` has TWO variants** (reconciled post-build; consumers tell
+them apart by `videoId`):
+1. **Video-attention** (decision #12, `tabs.onActivated`): the user focused a
+   YouTube tab showing a different video than the last focused video tab —
+   carries `videoId` + `fromVideoId` (`source: 'browse'`), never
+   `sessionId`/`fromSessionId`/`reason`.
+2. **Session-management** (integration-contract ruling 4, added by stage 06 at
+   the stage-04 seams): CREATE/SET_ACTIVE/DELETE/MERGE_SESSION — carries
+   `videoId: null`, `sessionId` (the session now active / merge target),
+   `fromSessionId` (previous active / deleted / merged-away session) and
+   `reason` (`source: 'manual'`), never `fromVideoId`.
 `source` semantics: `intercept` = tab-interception queue add; `collect` = Collect button (incl. drained `yt_logged_videos`); `manual` = explicit user action in panel/popup; `shorts` = organic navigation to a /shorts/ URL; `browse` = organic navigation to a watch URL; `content` = automatic content-script telemetry. **Note for contract reconciliation:** `browse` and `content` extend the lead's four-value enum.
 
 **NEW `STORAGE_KEYS.SUGGEST_SCORES = 'yt_suggest_scores'`** — written ONLY by the worker; panel obtains it via `MSG.GET_SUGGEST_SCORES` (never reads the key directly, because a read can't trigger the lazy recompute):
@@ -451,7 +466,7 @@ constants → activity-log.js → service-worker hooks → content.js telemetry 
 
 - **Real telemetry end-to-end:** extend the manual `tests/test-panel-live.js` run — open a real YouTube video headed, let it play ≥ 35 s (one 30 s flush), then `sw.evaluate` read the log: a `watch_progress` event exists with real `title`/`channel` scraped from the live DOM and plausible `maxPercent`. The 1 s tick needs real playing media; headless fake pages have no playable stream.
 - **Export from the real side panel chrome:** the headless test downloads from a panel document opened as a tab; the true side-panel window must be verified once headed (open panel via popup gesture, click Export, confirm the file lands in the Downloads bar). If Chrome ever blocks it there, apply fallback (1) from decision #11.
-- **`session_switched`:** requires real tab activation focus events across two YouTube tabs — verify headed by switching tabs and reading the log.
+- **`session_switched`:** originally listed headed-only; now ALSO covered headless in `test-analytics.js` — Playwright `page.bringToFront()` fires `chrome.tabs.onActivated`, so the video-attention variant (videoId/fromVideoId, same-video no-op) and the session-management variant (create/switch/delete/merge reasons, already-active no-op) are both asserted automatically. A headed sanity pass with real focus events remains a nice-to-have, not a gate.
 
 ---
 

@@ -1,8 +1,10 @@
 /**
  * Live E2E (headed, manual): loads REAL youtube.com, enables the in-page
  * queue strip with a seeded queue, and verifies the strip injects into the
- * real masthead between #center and #end. Captures
- * screenshots/stages/viewing-modes/strip-live-youtube.png for design review.
+ * real masthead between #center and #end — on the HOME page, on a WATCH
+ * page, and on SEARCH RESULTS under the real DARK theme (plan §6 matrix).
+ * Captures screenshots/stages/viewing-modes/strip-live-youtube*.png for
+ * design review.
  * Run manually: node tests/test-viewing-live.js
  */
 const { chromium } = require('playwright');
@@ -117,6 +119,59 @@ function check(label, condition, detail) {
     path: path.join(stageShotDir, 'strip-live-youtube-full.png'),
   });
   console.log('  Screenshot: screenshots/stages/viewing-modes/strip-live-youtube-full.png');
+
+  // --- Strip on a real WATCH page (plan §6: strip placement on watch pages) ---
+  const stripState = () => page.evaluate(() => {
+    const s = document.getElementById('ytm-inpage-queue');
+    if (!s) return null;
+    const center = document.querySelector('ytd-masthead #container #center');
+    const rect = s.getBoundingClientRect();
+    return {
+      siblingOfCenter: center ? center.nextElementSibling === s : false,
+      tiles: s.querySelectorAll('.ytm-ipq-item').length,
+      visible: rect.width > 0 && rect.height > 0 && rect.top < 80,
+      dark: document.documentElement.hasAttribute('dark'),
+    };
+  });
+
+  console.log('Navigating to a real watch page...');
+  await page.goto('https://www.youtube.com/watch?v=jNQXAC9IVRw', {
+    waitUntil: 'domcontentloaded', timeout: 60000,
+  });
+  await page.waitForTimeout(5000);
+  const watchStrip = await stripState();
+  check('Strip present and placed in the masthead on a WATCH page',
+    !!watchStrip && watchStrip.siblingOfCenter && watchStrip.visible,
+    JSON.stringify(watchStrip));
+  check('Strip tiles render on the watch page (got ' + (watchStrip && watchStrip.tiles) + ')',
+    !!watchStrip && watchStrip.tiles === 5);
+  await page.screenshot({
+    path: path.join(stageShotDir, 'strip-live-watch.png'),
+    clip: { x: 0, y: 0, width: 1500, height: 120 },
+  });
+  console.log('  Screenshot: screenshots/stages/viewing-modes/strip-live-watch.png');
+
+  // --- Strip on real SEARCH RESULTS under the real DARK theme ---
+  // PREF f6=400 switches youtube.com to dark without an account
+  await context.addCookies([{
+    name: 'PREF', value: 'f6=400', domain: '.youtube.com', path: '/',
+  }]);
+  console.log('Navigating to real search results (dark theme)...');
+  await page.goto('https://www.youtube.com/results?search_query=test', {
+    waitUntil: 'domcontentloaded', timeout: 60000,
+  });
+  await page.waitForTimeout(5000);
+  const searchStrip = await stripState();
+  check('Dark theme active on search results', !!searchStrip && searchStrip.dark,
+    JSON.stringify(searchStrip));
+  check('Strip present and placed in the masthead on SEARCH RESULTS (dark)',
+    !!searchStrip && searchStrip.siblingOfCenter && searchStrip.visible,
+    JSON.stringify(searchStrip));
+  await page.screenshot({
+    path: path.join(stageShotDir, 'strip-live-search-dark.png'),
+    clip: { x: 0, y: 0, width: 1500, height: 120 },
+  });
+  console.log('  Screenshot: screenshots/stages/viewing-modes/strip-live-search-dark.png');
 
   await context.close();
 

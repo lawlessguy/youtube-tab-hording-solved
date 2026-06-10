@@ -224,8 +224,10 @@
 
   // Capture phase beats YouTube's own key handlers; the editable guard
   // preserves text undo in the comment box / search field, and empty stacks
-  // pass the key through untouched.
-  document.addEventListener('keydown', (e) => {
+  // pass the key through untouched. Named so openDocPip() can register the
+  // SAME handler on the PiP window's document — keystrokes typed while the
+  // floating window has focus must keep working (contract ruling 6).
+  function handleSeekHistoryKeydown(e) {
     if (!e.ctrlKey || e.altKey || e.metaKey) return;
     const k = (e.key || '').toLowerCase();
     if (k !== 'z' && k !== 'y') return;
@@ -244,7 +246,8 @@
     suppressSeekRecording = true;
     video.currentTime = target;
     showSeekToast(target, redo);
-  }, true);
+  }
+  document.addEventListener('keydown', handleSeekHistoryKeydown, true);
 
   // --- Watch Progress (20% = marked watched) ---
 
@@ -747,6 +750,10 @@
     win.addEventListener('resize', () => {
       try { window.dispatchEvent(new Event('resize')); } catch {}
     });
+    // Timeline-history shortcuts while the PiP window itself has focus —
+    // same handler, capture phase; it dies with the PiP document on close,
+    // so no teardown is needed in restorePipPlayer
+    try { pdoc.addEventListener('keydown', handleSeekHistoryKeydown, true); } catch {}
     window.dispatchEvent(new Event('resize')); // YouTube re-measures
   }
 
@@ -824,7 +831,9 @@
         navigator.mediaSession.setActionHandler('enterpictureinpicture', async () => {
           try {
             const video = getVideoElement();
-            if (video && !document.pictureInPictureElement) {
+            // !docPipWindow: while OUR floating window is open, the video
+            // already floats — requesting classic PiP on it would only reject
+            if (video && !document.pictureInPictureElement && !docPipWindow) {
               await video.requestPictureInPicture(); // gesture-free here by spec
             }
           } catch {}
@@ -868,7 +877,8 @@
 
   // First loop boundary = "finished": previous observed currentTime within
   // 0.75s of duration, new one < 0.5s, and no manual seek in the last 1.5s.
-  // Fires at most once per videoId (reset on SPA navigation).
+  // ACTS at most once per videoId (latch reset on SPA navigation, or released
+  // when both toggles were off so a later enable still works on this Short).
   function setupShortsLoopWatch() {
     const video = getVideoElement();
     if (!video || video._ytmLoopBound) return; // Shorts reuse one <video> across items
@@ -883,19 +893,31 @@
       if (!wrapped) return;
       const id = getCurrentVideoId();
       if (!id || id === lastLoopFiredId) return;
+      // Provisional latch (blocks re-fire while the async settings check
+      // runs); released when no action was taken so that enabling a toggle
+      // mid-Short takes effect at the NEXT loop boundary, not only after a
+      // navigation away
       lastLoopFiredId = id;
-      handleShortFinished(id);
+      handleShortFinished(id).then((acted) => {
+        if (!acted && lastLoopFiredId === id) lastLoopFiredId = null;
+      });
     });
   }
 
+  // Returns true when an auto-behavior actually fired (the caller keeps the
+  // once-per-videoId latch only in that case)
   async function handleShortFinished(videoId) {
     const s = await getSettings(); // cachedSettings, refreshed by storage.onChanged
     if (s.shortsAutoClose) {
       // Worker closes THIS tab only (sender-validated + isShortUrl-checked)
       safeSend({ type: 'CLOSE_SHORT_TAB', videoId });
-    } else if (s.shortsAutoScroll) {
-      clickShortsNav('next');
+      return true;
     }
+    if (s.shortsAutoScroll) {
+      clickShortsNav('next');
+      return true;
+    }
+    return false;
   }
 
   function clickShortsNav(dir) {
@@ -1677,7 +1699,9 @@
 
   // Local copy of the worker's comparator (IIFE — cannot import). 'suggested'
   // has no per-video field here and falls back to addedAt, matching the
-  // worker's own fallback sorts.
+  // worker's own fallback sorts — sanctioned divergence from the panel's
+  // channelScore ranking (contract ruling 3: suggested sort is panel-side;
+  // contract section 2: worker fallback sorts treat it as addedAt).
   function sortVideosList(videos, sortBy, direction) {
     return [...videos].sort((a, b) => {
       let va, vb;

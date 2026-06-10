@@ -22,6 +22,7 @@
     "test:pip": "node tests/test-pip.js",
     "test:shorts": "node tests/test-shorts.js",
     "test:panel-live": "node tests/test-panel-live.js",
+    "test:sessions-live": "node tests/test-sessions-live.js",
     "test:player-live": "node tests/test-player-live.js",
     "test:viewing-live": "node tests/test-viewing-live.js",
     "test:pip-live": "node tests/test-pip-live.js",

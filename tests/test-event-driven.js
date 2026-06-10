@@ -42,11 +42,17 @@ function check(label, condition, detail) {
   // Routing a www.youtube.com URL lets the content script run against
   // controlled HTML (real recommendations don't render reliably headless)
   console.log('\n--- Thumbnail badges react to queue changes ---');
-  const FAKE_PAGE = `<!DOCTYPE html><html><head><title>t</title></head><body>
-    <div style="position:relative"><a id="thumbnail" href="/watch?v=BADGETEST01"><img alt=""></a></div>
-    <div style="position:relative"><a id="thumbnail" href="/watch?v=BADGETEST02"><img alt=""></a></div>
-    <div style="position:relative"><a id="thumbnail" href="/watch?v=BADGETEST03"><img alt=""></a></div>
-    <div style="position:relative" id="shorts-shelf"><a class="shortsLockupViewModelFake" href="/shorts/BADGETEST04"><img alt=""></a></div>
+  // Fixed-size thumbnail boxes (not zero-height wrappers) so the stage
+  // screenshot demonstrates real top-left badge placement, not just injection
+  const FAKE_PAGE = `<!DOCTYPE html><html><head><title>t</title><style>
+    .thumbbox { position:relative; width:160px; height:90px; background:#888;
+                display:inline-block; margin:8px; }
+    .thumbbox a, .thumbbox img { display:block; width:100%; height:100%; }
+  </style></head><body>
+    <div class="thumbbox"><a id="thumbnail" href="/watch?v=BADGETEST01"><img alt=""></a></div>
+    <div class="thumbbox"><a id="thumbnail" href="/watch?v=BADGETEST02"><img alt=""></a></div>
+    <div class="thumbbox"><a id="thumbnail" href="/watch?v=BADGETEST03"><img alt=""></a></div>
+    <div class="thumbbox" id="shorts-shelf"><a class="shortsLockupViewModelFake" href="/shorts/BADGETEST04"><img alt=""></a></div>
   </body></html>`;
   await context.route('https://www.youtube.com/__badge_test__', route =>
     route.fulfill({ status: 200, contentType: 'text/html', body: FAKE_PAGE }));

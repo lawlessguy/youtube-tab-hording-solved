@@ -591,3 +591,26 @@ On real youtube.com in `npm run test:debug`-style headed Chrome:
   is the supported path; true column re-layout is fragile and unplanned).
 - Persisting seek history across reloads, or a seek-history UI list.
 - A settings toggle for timeline history (always-on by decision 13).
+- **Reverse speed sync into YouTube's own settings-menu UI** (convenience descope, made
+  explicit at the fix pass): `setSpeed()` writes `video.playbackRate` directly and never
+  calls the main-world `#movie_player.setPlaybackRate()`, so the native gear menu can
+  display a stale speed while the extension drives the real rate. Native→extension sync
+  is real-time; extension→native-menu is not. The named follow-up is a tiny main-world
+  shim calling `setPlaybackRate(v)` on SET_SPEED (same technique as risk 2's `setSize()`),
+  which would also remove the rate-reassertion divergence behind the arming heuristic.
+- **Miniplayer ('i'-key corner player) resize** (made explicit at the fix pass):
+  `applyPlayerSize()` gates on `location.pathname === '/watch'` and the miniplayer plays
+  on non-watch paths, so it never receives handles. Its container is YouTube-managed
+  fixed-position chrome — resizing it is genuinely fragile; default + theater are the
+  supported modes, fullscreen is excluded per spec.
+- **Left/top drag edges** (decision 1, surfaced here for visibility): only right edge,
+  bottom edge, and the bottom-right corner get handles (bottom only in theater) — the
+  player is left/top-anchored by YouTube's layout, so left/top handles would fight it.
+  Both dimensions remain fully adjustable, which satisfies the spec's purpose.
+- **Live re-clamp on window shrink**: stored sizes are clamped at APPLY time only (init,
+  SPA nav, settings change, mode flip — decision 7); there is no window-resize listener
+  re-running `writeResizeStyle()`, so shrinking the browser mid-watch leaves the fixed
+  rule oversized until the next apply trigger. User-recoverable (drag / double-click
+  reset). A naive listener must guard against recursion — the code dispatches synthetic
+  window resize events after every style write (the textContent-changed check is the
+  existing guard).

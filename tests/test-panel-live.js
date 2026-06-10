@@ -110,6 +110,41 @@ function check(label, condition, detail) {
 
   await ytPage.waitForTimeout(2500); // let metadata enrichment land in the panel
 
+  // --- Real telemetry end-to-end (plan 06 §6 headed item) ---
+  // ≥35s of real playback must yield a watch_progress event whose title and
+  // channel were scraped from the live DOM, with a plausible maxPercent.
+  // (Export from the genuine side-panel chrome remains a MANUAL check: the
+  // side panel window is not driveable by Playwright clicks.)
+  console.log('Playing the video ~45s to capture real watch telemetry...');
+  await sw.evaluate(() => chrome.storage.local.set({
+    yt_activity_log: { v: 1, seq: 0, events: [] },
+  }));
+  await ytPage.bringToFront();
+  await ytPage.evaluate(() => {
+    const v = document.querySelector('video');
+    if (v) { v.muted = true; return v.play().catch(() => {}); }
+  });
+  await ytPage.waitForTimeout(45000); // one 30s flush + slack
+  const wpEvent = await sw.evaluate(async () => {
+    const r = await chrome.storage.local.get('yt_activity_log');
+    return (r.yt_activity_log?.events || [])
+      .filter(e => e.type === 'watch_progress').pop() || null;
+  });
+  check('watch_progress captured from real playback', !!wpEvent, JSON.stringify(wpEvent));
+  check('Telemetry title scraped from the live DOM',
+    typeof wpEvent?.title === 'string' && wpEvent.title.length > 0,
+    JSON.stringify(wpEvent?.title ?? null));
+  check('Telemetry channel scraped from the live DOM',
+    typeof wpEvent?.channel === 'string' && wpEvent.channel.length > 0,
+    JSON.stringify(wpEvent?.channel ?? null));
+  check('Telemetry secondsWatched plausible (≥20)',
+    typeof wpEvent?.secondsWatched === 'number' && wpEvent.secondsWatched >= 20,
+    String(wpEvent?.secondsWatched));
+  check('Telemetry maxPercent plausible (1–100)',
+    typeof wpEvent?.maxPercent === 'number' &&
+    wpEvent.maxPercent >= 1 && wpEvent.maxPercent <= 100,
+    String(wpEvent?.maxPercent));
+
   // Desktop screenshot — page.screenshot can't capture browser chrome.
   // execFileSync with an argument array: no shell string interpolation; the
   // path lands in a PS single-quoted literal (backslashes are literal there).

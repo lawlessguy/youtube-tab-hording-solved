@@ -275,6 +275,16 @@ function makeVideo(id, overrides = {}) {
     nowPlaying: document.getElementById('now-playing').offsetParent === null,
     watched: document.querySelector('.section').offsetParent === null,
     contentTabs: document.querySelector('.content-tabs').offsetParent !== null,
+    // The CSS must hide .shorts-tools in slim even when the JS would show it
+    // (displayed tab is a Short) — force the inline style on to prove it
+    shortsTools: (() => {
+      const st = document.getElementById('shorts-tools');
+      const prev = st.style.display;
+      st.style.display = '';
+      const isHidden = st.offsetParent === null;
+      st.style.display = prev;
+      return isHidden;
+    })(),
   }));
   check('Toggle bar hidden in slim', hidden.toggleBar);
   check('Controls bar hidden in slim', hidden.controlsBar);
@@ -282,6 +292,7 @@ function makeVideo(id, overrides = {}) {
   check('Now-playing hidden in slim', hidden.nowPlaying);
   check('Watched section hidden in slim', hidden.watched);
   check('Content tabs (Videos/Shorts) still visible', hidden.contentTabs);
+  check('Shorts tools strip hidden in slim (CSS rule, fix pass)', hidden.shortsTools);
 
   const slimGeo = await panel.evaluate(() => {
     const item = document.querySelector('.video-item');
@@ -327,6 +338,31 @@ function makeVideo(id, overrides = {}) {
   await panel.waitForTimeout(300);
   await panel.screenshot({ path: path.join(stageShotDir, 'sidepanel-slim-hover.png') });
   console.log('  Screenshot: screenshots/stages/viewing-modes/sidepanel-slim-hover.png');
+
+  // B.2b channel filter chip in slim (fix pass, cross-group 01×04): an
+  // active channel filter keeps constraining the tile list, so its only
+  // indicator/clear affordance must stay visible in slim mode
+  console.log('\n--- B.2b channel chip stays visible in slim ---');
+  await panel.evaluate(() => {
+    // .channel-link is display:none in slim — element click still dispatches
+    document.querySelector('#video-list .video-item .channel-link').click();
+  });
+  await panel.waitForTimeout(600);
+  const slimChip = await panel.evaluate(() => ({
+    chipVisible: document.getElementById('channel-chip').offsetParent !== null,
+    name: document.getElementById('channel-chip-name').textContent,
+    tiles: document.querySelectorAll('#video-list .video-item').length,
+  }));
+  check('Channel chip VISIBLE in slim while a filter is active',
+    slimChip.chipVisible, JSON.stringify(slimChip));
+  check('Filter constrains the slim tiles (1 of 40)', slimChip.tiles === 1,
+    'got ' + slimChip.tiles);
+  await panel.click('#channel-chip-clear');
+  await panel.waitForTimeout(600);
+  check('Chip clear works from slim mode (full list restored)',
+    await panel.evaluate(() =>
+      document.getElementById('channel-chip').style.display === 'none' &&
+      document.querySelectorAll('#video-list .video-item').length > 1));
 
   // B.3 virtual scroll still works at the slim height
   console.log('\n--- B.3 slim virtual scroll ---');

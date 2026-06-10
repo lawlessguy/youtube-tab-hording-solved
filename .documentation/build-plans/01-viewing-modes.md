@@ -606,3 +606,16 @@ flips in storage and the button gains `.active`. From the popup page check
   conflicts with the side-panel architecture and tab-tracking invariants).
 - Slim-mode redesign of the now-playing card (hidden in slim; revisit only if
   daily use demands it).
+- **Strip ordering under `sortBy: 'suggested'`** (made explicit at the fix
+  pass): the masthead strip's local comparator falls back to `addedAt` for
+  'suggested' — matching the worker's own fallback sorts (contract section 2 +
+  ruling 3: suggested sort is panel-side) rather than this plan's "same
+  comparator as the panel" wording. A user running Suggested sort sees
+  addedAt-desc in the strip. True parity (reading `yt_suggest_scores` from
+  storage and inlining the channelScore ranking) is the named follow-up if it
+  ever matters.
+- **Slim mode × stage-07 shorts surfaces** (reconciled at the fix pass):
+  `body.slim` hides the `.shorts-tools` control strip; `#shorts-player` stays
+  visible as a deliberate exception (it is content the user chose, not a
+  control), as does `.channel-chip` (an active filter's only indicator/clear
+  affordance).

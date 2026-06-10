@@ -27,7 +27,7 @@ Chrome Manifest V3 extension — "YouTube Tab Manager". Manages YouTube video qu
   - `test-viewing-modes.js` (`test:modes`) — in-page masthead queue strip + slim panel mode
   - `test-pip.js` (`test:pip`) — PiP controls row, auto-PiP wiring, Document-PiP fallback rules
   - `test-shorts.js` (`test:shorts`) — shorts tools strip, left rail, in-panel player, auto-scroll/auto-close
-- Headed/manual live checks against real YouTube (NOT in `test:all`): `test:panel-live`, `test:player-live`, `test:viewing-live`, `test:pip-live`, `test:shorts-live`, plus `node tests/test-indicators.js`
+- Headed/manual live checks against real YouTube (NOT in `test:all`): `test:panel-live` (includes real watch-telemetry capture), `test:sessions-live` (two-OS-window smart play, real middle-click, real channel enrichment), `test:player-live`, `test:viewing-live` (home + watch + dark search), `test:pip-live`, `test:shorts-live` (includes the real embed onStateChange bridge), plus `node tests/test-indicators.js`
 
 ## Architecture
 
@@ -52,7 +52,7 @@ All state lives in `chrome.storage.local`. UI surfaces communicate through `chro
 
 **Open-tab ids:** `yt_open_tab_ids` lives in `chrome.storage.session` — sorted unique videoIds of open tabs. Worker-only writer, recomputed event-driven from `tabs.query` (tab create/navigate/remove/replace + worker wake) with a 250ms debounce, written only when the set actually differs. Deliberately OUTSIDE the storage.update mutex (that mutex serializes local only; this value is derived ground truth) — do not route it through storage.update. The panel reacts via `storage.onChanged(area === 'session')`.
 
-**Activity log:** `yt_activity_log` (`{v:1, seq, events[]}`, 5000-event FIFO cap, `seq` monotonic across rotation) is appended worker-side via `logActivity()` in `utils/activity-log.js` — best-effort, issues its own storage.update, must be called sequentially AFTER a caller's own update completes, never from inside an update callback. Suggested-sort scores are cached in `yt_suggest_scores` keyed to `computedAtSeq` (stale seq forces recompute).
+**Activity log:** `yt_activity_log` (`{v:1, seq, events[]}`, 5000-event FIFO cap, `seq` monotonic across rotation) is appended worker-side via `logActivity()` in `utils/activity-log.js` — best-effort, issues its own storage.update, must be called sequentially AFTER a caller's own update completes, never from inside an update callback. Suggested-sort scores are cached in `yt_suggest_scores` keyed to `computedAtSeq` (stale seq forces recompute). Logging is always on; the kill switch is `yt_settings.activityLogEnabled = false` (no UI toggle in v1 — set it from a console/future settings page). `session_switched` has TWO variants distinguished by `videoId`: video-attention (`tabs.onActivated`, `videoId`+`fromVideoId`) and session-management (create/switch/delete/merge, `videoId:null` + `sessionId`/`fromSessionId`/`reason`) — see plan 06 §3.1.
 
 Key flows:
 - Side panel → `MSG.GET_VIDEOS` → service worker reads storage → returns array
@@ -82,7 +82,7 @@ New YouTube tabs are caught via `chrome.tabs.onCreated` + `chrome.tabs.onUpdated
 - `.scroll-area` (flex: 1, overflow-y: auto, **position: relative — load-bearing**: the virtual scroller measures card windows via `offsetTop`, which must be relative to this scroll container)
 - `#shorts-player` must stay the FIRST child of `.scroll-area` (scroller re-measures offsetTop under it); `#shorts-tools` strip sits after `.controls-bar` and is hidden unless the displayed tab is a Short
 - Video lists are virtualized: ALL geometry math goes through the `cardHeight()` accessor — 63 in full mode (59px `.video-item` + 4px margin), 94 in slim (90 + 4). Never hardcode 63 in new code; change CSS heights and the constants together
-- Slim mode (`panelMode: 'slim'`, `body.slim`) hides most of `.sticky-top` and shows thumbnail-only tiles — the TAB/addCount chips must stay visible (hover overlay must not cover the top 14px of the thumb)
+- Slim mode (`panelMode: 'slim'`, `body.slim`) hides most of `.sticky-top` (including the `.shorts-tools` strip) and shows thumbnail-only tiles — the TAB/addCount chips must stay visible (hover overlay must not cover the top 14px of the thumb). Deliberate visibility exceptions in slim: session bar, content-tabs, `.channel-chip` (an active filter's only indicator) and `#shorts-player` (content, not a control)
 - Card chips: `.thumb-tab-badge` top-LEFT, `.thumb-addcount` top-RIGHT (both pointer-events:none), `.thumb-duration` bottom-right
 - Videos/Shorts shown via content tabs (only one visible at a time)
 - DOM built with safe `el()` helper — no `innerHTML` with user data (security hook enforced)
@@ -107,8 +107,9 @@ New YouTube tabs are caught via `chrome.tabs.onCreated` + `chrome.tabs.onUpdated
 - Every tab-closing path (`CLOSE_SHORTS_TABS`, `CLOSE_VISIBLE_TABS`, `REMOVE_DUPLICATES`, intercept 'close') preserves the active tab — never close what the user is watching. The ONE sanctioned exception: shorts auto-close (`CLOSE_SHORT_TAB`) closes the validated SENDER tab when its Short ends, and only while `shortsAutoClose` is enabled
 - `sortBy: 'suggested'` is computed panel-side from `GET_SUGGEST_SCORES` (worker fallback sorts treat it as `addedAt`); drag-reorder is disabled while it is active
 - Document PiP bails out to classic video PiP whenever `audioContext` exists — the volume-boost `createMediaElementSource` chain silences a video moved into another document. While the player floats in Doc-PiP the resize handles no-op (the on-page container holds a placeholder), and `getVideoElement()` searches the PiP document so timeline-history/speed-sync keep working on the floated video
-- Auto-PiP (`pipAutoEnabled`) rides MediaSession `enterpictureinpicture` — Chrome decides eligibility and shows its own prompt on first use; the call is gesture-free only inside that handler
+- Auto-PiP (`pipAutoEnabled`) rides MediaSession `enterpictureinpicture` — Chrome decides eligibility and shows its own prompt on first use; the call is gesture-free only inside that handler. It opens the CLASSIC (native) PiP window, which nothing can style: the opacity slider and S/M/L presets apply ONLY to the manually-invoked Document-PiP Float window (design-sanctioned, plan 03 §7; disclosed in the tooltips — keep that disclosure when editing them)
 - Content-script `<head>` CSS injection order is load-bearing: hideRecs style → resize style → anything later. Resize wins specificity with doubled-id selectors; later styles must not `!important`-override player sizing
+- The in-panel Shorts embed needs TWO non-obvious pieces to work against real YouTube: (1) the raw widget protocol emits `onStateChange` only after the parent posts the `addEventListener` command (the `listening` handshake alone is NOT enough); (2) real embeds error `153: Video player configuration error` without an HTTP Referer, which extension pages never send — the worker installs a session DNR rule (id 153153, `declarativeNetRequestWithHostAccess`) setting Referer to the extension's own origin for `/embed/` sub_frames initiated by this extension only. Don't remove either without re-running `test:shorts-live`
 - PowerShell 5.1 `Get-Content`/`Set-Content` mangles this repo's UTF-8 files (em-dashes/arrows become mojibake) — use proper editing tools, not shell pipelines, for source edits
 
 <!-- progress-journal -->

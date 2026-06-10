@@ -266,6 +266,32 @@ function watchPageHtml(dataUrl) {
     check('Boost request clamps to 100% while floated (volume 1, got ' + clampedVol + ')',
       clampedVol === 1);
 
+    // Transparency contract on the REAL float: open-time opacity applies,
+    // a panel-side settings write live-drives the open window, and the 30%
+    // floor clamps (spec: transparency slider for the floating player)
+    const readPipOpacity = () => sw.evaluate(async (tid) => {
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: tid },
+        func: () => {
+          const w = window.documentPictureInPicture?.window;
+          return w ? w.document.documentElement.style.getPropertyValue('--ytm-pip-op') : null;
+        },
+      });
+      return res[0]?.result;
+    }, tabId);
+    check('Open-time opacity 60 applied (--ytm-pip-op 0.6)',
+      (await readPipOpacity()) === '0.6', 'got ' + (await readPipOpacity()));
+    await mergeSettings({ pipOpacity: 40 });
+    await watchPage.waitForTimeout(700);
+    check('Settings write live-drives the open window to 0.4',
+      (await readPipOpacity()) === '0.4', 'got ' + (await readPipOpacity()));
+    await mergeSettings({ pipOpacity: 5 });
+    await watchPage.waitForTimeout(700);
+    check('Opacity floor clamps 5 → 0.3',
+      (await readPipOpacity()) === '0.3', 'got ' + (await readPipOpacity()));
+    await mergeSettings({ pipOpacity: 60 });
+    await watchPage.waitForTimeout(400);
+
     await watchPage.screenshot({ path: path.join(stageShotDir, 'fake-watch-floated-placeholder.png') });
 
     // exitPip restores the player

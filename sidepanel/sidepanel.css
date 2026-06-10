@@ -513,15 +513,20 @@ header {
 /* Header mode toggle active state */
 #panel-mode-toggle.active { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
 
-/* Collapse heavy controls — thumbnails only. Kept: header icon buttons, the
-   session bar (other sessions would be unreachable, same reasoning as
-   content-tabs), and .content-tabs (Videos/Shorts switch). */
+/* Collapse heavy controls — thumbnails only. Kept (deliberate exceptions):
+   header icon buttons, the session bar (other sessions would be unreachable,
+   same reasoning as content-tabs), .content-tabs (Videos/Shorts switch),
+   .channel-chip (an ACTIVE channel filter keeps constraining the tile list —
+   the chip is its only indicator/clear affordance, so hiding it would look
+   like lost videos), and #shorts-player (it is content, not a control: the
+   Short the user chose to watch in the panel). The .shorts-tools strip IS a
+   control row and is hidden below. */
 body.slim .watch-bar,
 body.slim .toggle-bar,
 body.slim .toggle-desc,
 body.slim .controls-bar,
 body.slim .filter-search-bar,
-body.slim .channel-chip,
+body.slim .shorts-tools,
 body.slim #now-playing,
 body.slim .section { display: none !important; }
 

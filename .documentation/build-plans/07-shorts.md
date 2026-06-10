@@ -722,6 +722,20 @@ These cannot be proven against routed fake pages:
    the pre-flight + Open-in-tab keeps UX honest.
 3. **jsapi postMessage protocol is undocumented:** ended-detection/auto-advance in the panel
    player may break without notice; designed fail-soft (manual prev/next always works).
+   **Fix-pass correction (empirically verified):** `{event:'listening'}` alone never yields
+   `onStateChange` — the parent must ALSO post
+   `{event:'command', func:'addEventListener', args:['onStateChange']}` (sent on iframe load
+   and re-asserted on the embed's `onReady`); `infoDelivery.playerState === 0` is accepted as
+   a belt-and-braces ended signal. The §4 load-handler snippet above predates this
+   correction — the shipped code in sidepanel.js is authoritative.
+   **Fix-pass correction 2 (live-verified):** real embeds refused to play inside the
+   extension panel at all — YouTube's player errors `153: Video player configuration error`
+   when the HTTP Referer is missing, and Chrome never sends one from `chrome-extension://`
+   documents. Shipped fix: `declarativeNetRequestWithHostAccess` permission + a session
+   rule (installed at worker start, id 153153) that sets `Referer` to the extension's own
+   origin on `/embed/` sub_frames initiated by THIS extension only. Probed: ext-origin
+   referer → plays; `https://www.youtube.com/` referer → error 152; no referer → 153.
+   Headed proof: `test-shorts-live.js` (embed plays + onStateChange arrives in the panel).
 4. **Capture-phase Left/Right swallow** could mask a *future* native Shorts binding.
 5. **`isTrusted:false` events:** any path relying on synthetic keyboard input is best-effort
    only; primary paths use element `.click()` which YouTube handles.

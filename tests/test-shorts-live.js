@@ -5,6 +5,9 @@
  *  - YouTube's nav-button selector (#navigation-button-down button /
  *    aria-label "Next video") still exists (auto-scroll's primary path)
  *  - ArrowRight/ArrowLeft scrub the real Shorts <video> by ±5s
+ *  - the in-panel embed bridge actually receives onStateChange messages from
+ *    a REAL embed (the widget protocol only emits them after the
+ *    addEventListener command — plan §6 headed item 4 / audit regression)
  * Captures screenshots/stages/shorts/live-shorts-rail.png for review.
  * Run manually: node tests/test-shorts-live.js
  */
@@ -38,6 +41,9 @@ function check(label, condition, detail) {
       `--disable-extensions-except=${extensionPath}`,
       `--load-extension=${extensionPath}`,
       '--window-size=1600,950',
+      // The embed-bridge check needs the panel-page iframe to autoplay
+      // without a gesture so playerState events flow
+      '--autoplay-policy=no-user-gesture-required',
     ],
     viewport: null,
   });
@@ -117,6 +123,54 @@ function check(label, condition, detail) {
   const shot = path.join(stageShotDir, 'live-shorts-rail.png');
   await page.screenshot({ path: shot });
   console.log('  Screenshot: ' + path.relative(extensionPath, shot));
+
+  // --- In-panel embed bridge against the REAL embed protocol ---
+  // The raw widget protocol emits onStateChange only after the parent posts
+  // the addEventListener command; this proves the subscription end-to-end.
+  console.log('Verifying the in-panel embed onStateChange bridge...');
+  const shortId = await page.evaluate(() =>
+    location.pathname.startsWith('/shorts/') ? location.pathname.split('/')[2] : null);
+  check('Live Short id resolved for the embed-bridge check', !!shortId, await page.url());
+  if (shortId) {
+    await sw.evaluate((id) => chrome.storage.local.set({
+      yt_videos: [{
+        id, url: 'https://www.youtube.com/shorts/' + id, title: 'Live bridge Short',
+        channel: 'live', thumbnail: '', duration: 30, addedAt: Date.now(),
+        uploadedAt: null, isShort: true, watched: false, starred: false,
+        sessionId: 'main', addCount: 1,
+      }],
+    }), shortId);
+    const extensionId = sw.url().split('/')[2];
+    const panel = await context.newPage();
+    await panel.goto('chrome-extension://' + extensionId + '/sidepanel/sidepanel.html');
+    await panel.waitForTimeout(1500);
+    await panel.evaluate(() => {
+      window.__ytmBridge = { stateChanges: 0, states: [] };
+      window.addEventListener('message', (e) => {
+        try {
+          const d = JSON.parse(e.data);
+          if (d.event === 'onStateChange') {
+            window.__ytmBridge.stateChanges++;
+            window.__ytmBridge.states.push(d.info);
+          }
+        } catch {}
+      });
+    });
+    await panel.evaluate((id) => openShortsPlayer(id), shortId);
+    await panel.waitForTimeout(10000); // embed load + autoplay + state events
+    const bridge = await panel.evaluate(() => ({
+      iframe: !!document.querySelector('#shorts-player iframe'),
+      ...window.__ytmBridge,
+    }));
+    check('In-panel embed iframe rendered for the live Short', bridge.iframe);
+    check('Embed posts onStateChange after the addEventListener command (got ' +
+      bridge.stateChanges + ': ' + JSON.stringify(bridge.states) + ')',
+      bridge.stateChanges > 0);
+    const bridgeShot = path.join(stageShotDir, 'live-panel-embed-bridge.png');
+    await panel.screenshot({ path: bridgeShot });
+    console.log('  Screenshot: ' + path.relative(extensionPath, bridgeShot));
+    await panel.close();
+  }
 
   await context.close();
 

@@ -265,6 +265,98 @@ function mkVideo(id, extra = {}) {
     !queued.some(v => v.id === 'OPENTEST001'), JSON.stringify(queued.map(v => v.id)));
   await ytPage.close();
 
+  // ===== 3b. session_switched — video-attention variant (tabs.onActivated) =====
+  // bringToFront() fires chrome.tabs.onActivated, so the plan-06 decision-12
+  // hook is testable headless: focusing a YouTube tab showing a DIFFERENT
+  // video logs { videoId, fromVideoId }; same-video refocus logs nothing.
+  console.log('\n--- 3b. session_switched: tab attention (onActivated) ---');
+  const pageA = await context.newPage();
+  await pageA.goto('https://www.youtube.com/watch?v=SWITCHAAA01', { timeout: 30000 });
+  const pageB = await context.newPage();
+  await pageB.goto('https://www.youtube.com/watch?v=SWITCHBBB02', { timeout: 30000 });
+  await resetLog(); // discard the video_opened events from the gotos
+
+  const switchEvents = async () => (await getLog()).events
+    .filter(e => e.type === 'session_switched');
+
+  await pageA.bringToFront();
+  await pageA.waitForTimeout(700);
+  let sws = await switchEvents();
+  check('Focusing video tab A logs session_switched (videoId A)',
+    sws.length === 1 && sws[0].videoId === 'SWITCHAAA01', JSON.stringify(sws));
+  check('First attention event has fromVideoId null (cold cursor)',
+    sws[0]?.fromVideoId === null, JSON.stringify(sws[0]));
+
+  await pageB.bringToFront();
+  await pageB.waitForTimeout(700);
+  sws = await switchEvents();
+  check('A→B logs videoId B with fromVideoId A',
+    sws.length === 2 && sws[1].videoId === 'SWITCHBBB02' &&
+    sws[1].fromVideoId === 'SWITCHAAA01', JSON.stringify(sws[1]));
+
+  await panel.bringToFront(); // non-YouTube activation: no log, no cursor reset
+  await panel.waitForTimeout(400);
+  await pageB.bringToFront(); // back to the SAME video
+  await pageB.waitForTimeout(700);
+  sws = await switchEvents();
+  check('Non-YT detour + same-video refocus logs nothing (still 2 events)',
+    sws.length === 2, 'got ' + sws.length);
+
+  await pageA.bringToFront();
+  await pageA.waitForTimeout(700);
+  sws = await switchEvents();
+  check('B→A logs the reverse attention switch',
+    sws.length === 3 && sws[2].videoId === 'SWITCHAAA01' &&
+    sws[2].fromVideoId === 'SWITCHBBB02', JSON.stringify(sws[2]));
+  check('Attention variant never carries session-management fields',
+    sws.every(e => e.sessionId === undefined && e.reason === undefined),
+    JSON.stringify(sws));
+  // Park focus on the panel BEFORE closing: closing the ACTIVE video tab
+  // would activate the other video tab and append a stray attention event
+  await panel.bringToFront();
+  await panel.waitForTimeout(300);
+  await pageA.close();
+  await pageB.close();
+  await panel.waitForTimeout(300);
+
+  // ===== 3c. session_switched — session-management variant (stage-04 seams) =====
+  console.log('\n--- 3c. session_switched: session management seams ---');
+  await resetLog();
+  await sw.evaluate(() => chrome.storage.local.set({
+    yt_sessions: { activeId: 'main', list: [{ id: 'main', name: 'Main', createdAt: 0 }] },
+  }));
+
+  const created = await send({ type: 'CREATE_SESSION', name: 'Audit A' });
+  let mgmt = await switchEvents();
+  check('CREATE_SESSION appends one session_switched (reason create, from main)',
+    mgmt.length === 1 && mgmt[0].reason === 'create' &&
+    mgmt[0].sessionId === created?.session?.id && mgmt[0].fromSessionId === 'main' &&
+    mgmt[0].videoId === null, JSON.stringify(mgmt));
+
+  await send({ type: 'SET_ACTIVE_SESSION', sessionId: created.session.id });
+  mgmt = await switchEvents();
+  check('Switching to the already-active session appends nothing',
+    mgmt.length === 1, 'got ' + mgmt.length);
+
+  await send({ type: 'SET_ACTIVE_SESSION', sessionId: 'main' });
+  mgmt = await switchEvents();
+  check('SET_ACTIVE_SESSION appends reason switch with correct from/to',
+    mgmt.length === 2 && mgmt[1].reason === 'switch' && mgmt[1].sessionId === 'main' &&
+    mgmt[1].fromSessionId === created.session.id, JSON.stringify(mgmt[1]));
+
+  await send({ type: 'DELETE_SESSION', sessionId: created.session.id });
+  mgmt = await switchEvents();
+  check('DELETE_SESSION appends reason delete with the deleted id as from',
+    mgmt.length === 3 && mgmt[2].reason === 'delete' &&
+    mgmt[2].fromSessionId === created.session.id, JSON.stringify(mgmt[2]));
+
+  const created2 = await send({ type: 'CREATE_SESSION', name: 'Audit B' });
+  await send({ type: 'MERGE_SESSION', sourceSessionId: created2.session.id });
+  mgmt = await switchEvents();
+  check('MERGE_SESSION appends reason merge landing in main',
+    mgmt.length === 5 && mgmt[4].reason === 'merge' && mgmt[4].sessionId === 'main' &&
+    mgmt[4].fromSessionId === created2.session.id, JSON.stringify(mgmt[4]));
+
   // ===== 4. Suggest scoring + cache =====
   console.log('\n--- 4. Suggest scoring + seq-gated cache ---');
   const now = Date.now();

@@ -107,13 +107,27 @@ function shortsPageHtml(dataUrl) {
   const SHORTS_PAGE = shortsPageHtml(dataUrl);
   await context.route('https://www.youtube.com/shorts/*', route =>
     route.fulfill({ status: 200, contentType: 'text/html', body: SHORTS_PAGE }));
-  // Deterministic embeddability pre-flight: SHRTTEST002 is the UNPLAYABLE one
+  // Deterministic embeddability pre-flight: SHRTTEST002 is the UNPLAYABLE one.
+  // The playable stub mimics the REAL widget protocol's gating (audit
+  // regression): it reports onStateChange ONLY after the parent has posted
+  // the {event:'command', func:'addEventListener', args:['onStateChange']}
+  // message — the {event:'listening'} handshake alone must never be enough.
+  // The test triggers the synthetic 'ended' via a __test_end message.
   await context.route('https://www.youtube.com/embed/**', route => {
     const unplayable = route.request().url().includes('SHRTTEST002');
     const body = unplayable
       ? '<!DOCTYPE html><html><body>{"playabilityStatus":{"status":"UNPLAYABLE"},"playableInEmbed":false}</body></html>'
       : '<!DOCTYPE html><html><body style="background:#000;color:#666;font-family:Arial">' +
-        '<div style="padding:20px">embed stub {"playableInEmbed":true}</div></body></html>';
+        '<div style="padding:20px">embed stub {"playableInEmbed":true}</div>' +
+        '<script>let subscribed = false;' +
+        'window.addEventListener("message", (e) => {' +
+        '  let d; try { d = JSON.parse(e.data); } catch { return; }' +
+        '  if (d.event === "command" && d.func === "addEventListener" &&' +
+        '      Array.isArray(d.args) && d.args[0] === "onStateChange") subscribed = true;' +
+        '  if (d.event === "__test_end" && subscribed) {' +
+        '    parent.postMessage(JSON.stringify({ event: "onStateChange", info: 0 }), "*");' +
+        '  }' +
+        '});</scr' + 'ipt></body></html>';
     route.fulfill({ status: 200, contentType: 'text/html', body });
   });
   // Thumbnail stubs so fake videoIds don't 404 into the console watch
@@ -419,6 +433,55 @@ function shortsPageHtml(dataUrl) {
     const c = document.getElementById('shorts-player');
     return getComputedStyle(c).display === 'none' && !c.querySelector('iframe');
   }));
+
+  // Embed Referer shim (fix pass): without it, real embeds error 153 inside
+  // the panel. The session rule must target only extension-initiated
+  // /embed/ sub_frames and carry the extension's own origin as Referer.
+  const refererRule = await sw.evaluate(async () => {
+    const rules = await chrome.declarativeNetRequest.getSessionRules();
+    return rules.find(r => r.id === 153153) || null;
+  });
+  check('Embed Referer session rule installed (id 153153)', !!refererRule,
+    JSON.stringify(refererRule));
+  check('Referer rule scoped to this extension\'s /embed/ sub_frames',
+    refererRule?.condition?.urlFilter === '||youtube.com/embed/' &&
+    (refererRule?.condition?.resourceTypes || []).join(',') === 'sub_frame' &&
+    (refererRule?.condition?.initiatorDomains || []).length === 1,
+    JSON.stringify(refererRule?.condition));
+  check('Referer rule sets the extension\'s own origin',
+    refererRule?.action?.requestHeaders?.[0]?.header === 'Referer' &&
+    (refererRule?.action?.requestHeaders?.[0]?.value || '')
+      .startsWith('chrome-extension://'),
+    JSON.stringify(refererRule?.action));
+
+  // =====================================================================
+  console.log('\n--- B2. Embed ended-bridge (subscription-gated protocol) ---');
+  // The stub embed only reports 'ended' if the panel actually posted the
+  // addEventListener command — a regression to the listening-only handshake
+  // makes both checks below fail. On ended: mark watched + auto-advance.
+  await panel.click('#shorts-list .video-item[data-id="SHRTTEST001"] .card-panel-btn');
+  await panel.waitForTimeout(1000); // pre-flight (cached) + iframe load + handshake
+  await panel.evaluate(() => {
+    const f = document.querySelector('#shorts-player iframe');
+    f.contentWindow.postMessage(JSON.stringify({ event: '__test_end' }), '*');
+  });
+  await panel.waitForTimeout(1000);
+  const bridgeState = await panel.evaluate(() => {
+    const c = document.getElementById('shorts-player');
+    return {
+      visible: getComputedStyle(c).display !== 'none',
+      pos: c.querySelector('.sp-pos')?.textContent || '',
+      title: c.querySelector('.sp-title')?.textContent || '',
+    };
+  });
+  check('Ended bridge auto-advanced to the next Short (pos 2 / 2)',
+    bridgeState.visible && bridgeState.pos === '2 / 2', JSON.stringify(bridgeState));
+  const endedWatched = await sw.evaluate(async () =>
+    ((await chrome.storage.local.get('yt_videos')).yt_videos || [])
+      .find(v => v.id === 'SHRTTEST001')?.watched);
+  check('Ended bridge marked the finished Short watched', endedWatched === true);
+  await panel.click('#sp-close');
+  await panel.waitForTimeout(300);
 
   // =====================================================================
   console.log('\n--- C. Auto-close (the one sanctioned active-tab close) ---');
