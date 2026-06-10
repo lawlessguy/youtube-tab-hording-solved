@@ -16,7 +16,13 @@ let dataShorts = [];
 let dataWatched = [];
 const CARD_HEIGHT = 63; // Approximate card height including gap
 const RENDER_BUFFER = 8; // Extra cards above/below viewport
-let lastRenderKey = ''; // Track what's rendered to avoid redundant redraws
+const lastRenderKeys = new Map(); // containerId → rendered range, avoids redundant redraws
+
+// Re-rendering while a card is being dragged destroys the dragged node and
+// kills the drop, so renders are deferred until the drag ends
+let dragId = null;
+let dragInProgress = false;
+let renderPendingAfterDrag = false;
 
 // --- Helpers ---
 function fmt(min) {
@@ -148,7 +154,7 @@ async function loadVideos() {
     storeVisibleVideoOrder();
 
     // Force re-render of visible cards
-    lastRenderKey = '';
+    lastRenderKeys.clear();
     renderVisibleCards();
   } catch (e) { console.error('Videos error:', e); }
 }
@@ -176,9 +182,10 @@ function setVirtualHeight(containerId, count) {
 }
 
 function renderVisibleCards() {
-  const scrollArea = document.querySelector('.scroll-area');
-  const scrollTop = scrollArea.scrollTop;
-  const viewportHeight = scrollArea.clientHeight;
+  if (dragInProgress) {
+    renderPendingAfterDrag = true;
+    return;
+  }
 
   // Render the active video/shorts list
   renderVirtualList(
@@ -199,15 +206,17 @@ function renderVirtualList(containerId, data, isWatched) {
 
   if (!data.length) {
     const key = containerId + ':empty';
-    if (lastRenderKey === key) return;
+    if (lastRenderKeys.get(containerId) === key) return;
+    lastRenderKeys.set(containerId, key);
     container.textContent = '';
     container.style.height = '';
     container.style.position = '';
     container.appendChild(el('div', { class: 'empty-state', text: isWatched ? 'No watched videos' : 'No videos' }));
-    if (containerId === (activeTab === 'videos' ? 'video-list' : 'shorts-list')) lastRenderKey = key;
     return;
   }
 
+  // offsetTop is measured against .scroll-area (position: relative), which
+  // puts it in the same coordinate space as scrollTop
   const scrollArea = document.querySelector('.scroll-area');
   const scrollTop = scrollArea.scrollTop;
   const viewportHeight = scrollArea.clientHeight;
@@ -219,8 +228,8 @@ function renderVirtualList(containerId, data, isWatched) {
 
   // Skip if same range is already rendered
   const key = containerId + ':' + startIdx + ':' + endIdx;
-  if (key === lastRenderKey && containerId === (activeTab === 'videos' ? 'video-list' : 'shorts-list')) return;
-  if (containerId === (activeTab === 'videos' ? 'video-list' : 'shorts-list')) lastRenderKey = key;
+  if (lastRenderKeys.get(containerId) === key) return;
+  lastRenderKeys.set(containerId, key);
 
   container.textContent = '';
   container.style.height = (data.length * CARD_HEIGHT) + 'px';
@@ -495,7 +504,7 @@ document.querySelectorAll('.content-tab').forEach(tab => {
     activeTab = tab.dataset.tab;
     document.getElementById('video-list').style.display = activeTab === 'videos' ? '' : 'none';
     document.getElementById('shorts-list').style.display = activeTab === 'shorts' ? '' : 'none';
-    lastRenderKey = '';
+    lastRenderKeys.clear();
     renderVisibleCards();
     storeVisibleVideoOrder();
   });
@@ -561,11 +570,13 @@ document.querySelectorAll('.toggle-bar [data-desc]').forEach(btn => {
 });
 
 // --- Drag and Drop ---
+// dragId/dragInProgress live at module scope: a re-render swaps in fresh
+// cards with fresh listeners, and closure-local state would orphan the drag
 function setupDragDrop(container) {
-  let dragId = null;
   container.querySelectorAll('.video-item').forEach(item => {
     item.addEventListener('dragstart', e => {
       dragId = item.dataset.id;
+      dragInProgress = true;
       item.classList.add('dragging');
       e.dataTransfer.effectAllowed = 'move';
       e.dataTransfer.setData('text/plain', dragId);
@@ -574,6 +585,12 @@ function setupDragDrop(container) {
       item.classList.remove('dragging');
       container.querySelectorAll('.drag-over').forEach(x => x.classList.remove('drag-over'));
       dragId = null;
+      dragInProgress = false;
+      if (renderPendingAfterDrag) {
+        renderPendingAfterDrag = false;
+        lastRenderKeys.clear();
+        renderVisibleCards();
+      }
     });
     item.addEventListener('dragover', e => {
       e.preventDefault();
