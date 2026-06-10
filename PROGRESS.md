@@ -6,20 +6,20 @@
 
 ## Current State
 
-**Project:** YouTube Tab Manager — Chrome MV3 extension that queues YouTube videos in a side panel, tracks watch time, and controls volume/speed across tabs.
-**Status:** Active development — post-audit hardening complete, fully tested.
-**Last session:** 2026-06-10 — Fixed all 20+ findings from a full-codebase review, then root-caused and fixed the side panel never opening.
+**Project:** YouTube Tab Manager — Chrome MV3 extension: multi-session video queues in a side panel + in-page masthead strip, watch analytics with suggested sorting, player controls (resize, seek history, speed sync, PiP), Shorts tooling, and tab management.
+**Status:** Active development — 18-feature build complete, adversarially verified, live-tested against real YouTube.
+**Last session:** 2026-06-10 — Planned, built, and verified all 18 features from `.documentation/Features-Refined.md` via multi-agent workflows.
 
 **Where things stand:**
-- All review findings fixed: AudioContext mute bug, storage write races (now serialized through a `storage.update()` mutex), media controls routing to the wrong tab, virtual scroll geometry, tab-management guards, hostname-validated URLs, and polling replaced by `storage.onChanged` events.
-- Side panel opening works end-to-end — root cause was tab-scoped `sidePanel.setOptions` entries needing an explicit `path` (they don't inherit the manifest default).
-- Dead code removed (~400 lines incl. unreachable Gemini categorization subsystem); CLAUDE.md rewritten with the new invariants.
-- Test battery: 78 checks across 8 headless suites (`npm run test:all`) plus two manual headed tests (`test-panel-live.js`, `test-indicators.js`). All green.
-- All work merged to `main` (fast-forward to `6047d40`) and pushed to GitHub.
+- All 7 feature groups shipped: viewing modes (in-page queue strip, slim panel), player (resize, Ctrl-Z seek history, native speed sync), PiP (auto-PiP + Document-PiP floating player with opacity/size presets), sessions + channel filter + smart play, status indicators (open-tab chips, add counts), analytics (activity log, silent capture, Suggested sort, JSON export), and Shorts (arrow scrubbing, in-panel player, page rail, auto-scroll/close).
+- Build plans + integration contract live in `.documentation/build-plans/` (decisions and sanctioned descopes documented per plan, section 7).
+- Test battery: **446 checks across 15 headless suites** (`npm run test:all`) + 5 headed live suites + 4 manual probes (`tests/verify-*.js`) — all green; live-verified against real YouTube (real-Short auto-close, embed playback in panel, PiP over desktop, badge/strip/rail coexistence).
+- Notable platform learnings: extension-page YouTube embeds need a DNR Referer shim (error 153); classic auto-PiP windows can't be styled (opacity/size apply to the manual Float window only — disclosed in tooltips); Chrome side panel has a ~360px minimum width (slim mode uses a 164px tile column).
+- All work on `main`, pushed through the feature build.
 
 **Next up:**
-- Daily-use validation: confirm the side panel, intercept modes, and volume boost behave well in the user's real Chrome profile.
-- User to verify intercept 'close' behavior change is acceptable: foreground-opened videos are now queued but the tab stays open.
+- Daily-use validation of the new features in the real Chrome profile.
+- Known polish backlog (minor, recorded in the verification findings): pip-live strip-resize check silently skips; three live tests lack SW console.error instrumentation; stage live tests still capture PrimaryScreen instead of VirtualScreen.
 
 **Open decisions / blockers:**
 - None.
@@ -27,6 +27,15 @@
 ---
 
 ## Journal
+
+### 2026-06-10 — 18-feature build: plan → implement → verify (multi-agent)
+- Planned all features from `.documentation/Features-Refined.md`: 7 parallel planner agents produced build plans (each with 10+ self-answered clarifying questions); lead-reconciled cross-feature conflicts into `00-integration-contract.md` (storage shapes, message merges, `addVideoToQueue(opts)` signature, second toggle-bar row arbitration, session rulings).
+- Implemented in a 9-stage sequential workflow (scaffolding → indicators → sessions → analytics → player → viewing-modes → PiP → shorts → integration), one verified commit per stage (`37cc3a2..4d9d584`), each gated on green tests + reviewed screenshots (per-stage visual verification added mid-run at the user's suggestion — caught a dead Q/W badge selector: YouTube renamed its lockup class to camelCase in 2026).
+- Adversarial verification: 8 parallel auditors found 31 findings (3 blocking — all fixed in `7756bc9`): restored the dropped tab-attention `session_switched` analytics hook; fixed the in-panel Shorts embed which never actually played from extension pages (YouTube error 153 — fixed with a `declarativeNetRequestWithHostAccess` session rule injecting a Referer for extension-initiated `/embed/` subframes) plus the missing jsapi `onStateChange` subscription; disclosed the auto-PiP styling descope in tooltips.
+- Headed live sweep passed all 8 checks against real YouTube: real-Short auto-close at loop boundary, auto-scroll to next Short, real embed playing in the panel, strip+badges+rail geometric coexistence, the real side-panel column rendering all new UI, PiP floating window with visible 50% dimming over the desktop, zero extension-origin console errors. Repaired the stale legacy `test-indicators.js` (`4e4c76f`); kept the four verification probes (`41e60ca`).
+- Final battery: 446/446 across 15 suites; `node --check` clean on all 37 JS files. Lead did an independent hands-on GUI pass (fresh headed runs + screenshot review) before sign-off.
+- Sanctioned descopes (documented in plans §7): PiP position presets (platform-impossible), literal single-thumbnail panel width (Chrome ~360px minimum), styling the classic auto-PiP window, miniplayer resize.
+- **Next:** daily-use validation; minor test-polish backlog from live findings.
 
 ### 2026-06-10 — Merge to main
 - Fast-forward merged `claude/modest-einstein-ktsiwj` (the full audit-fix campaign below, 11 commits) into `main` and pushed to GitHub.
