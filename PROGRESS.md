@@ -15,10 +15,10 @@
 - Side panel opening works end-to-end — root cause was tab-scoped `sidePanel.setOptions` entries needing an explicit `path` (they don't inherit the manifest default).
 - Dead code removed (~400 lines incl. unreachable Gemini categorization subsystem); CLAUDE.md rewritten with the new invariants.
 - Test battery: 78 checks across 8 headless suites (`npm run test:all`) plus two manual headed tests (`test-panel-live.js`, `test-indicators.js`). All green.
-- Branch `claude/modest-einstein-ktsiwj`, pushed through `8c6e7b9`. Not yet merged to `main`.
+- All work merged to `main` (fast-forward to `6047d40`) and pushed to GitHub.
 
 **Next up:**
-- Merge the branch to `main` (or open a PR) once the user confirms the panel works in their daily Chrome.
+- Daily-use validation: confirm the side panel, intercept modes, and volume boost behave well in the user's real Chrome profile.
 - User to verify intercept 'close' behavior change is acceptable: foreground-opened videos are now queued but the tab stays open.
 
 **Open decisions / blockers:**
@@ -27,6 +27,10 @@
 ---
 
 ## Journal
+
+### 2026-06-10 — Merge to main
+- Fast-forward merged `claude/modest-einstein-ktsiwj` (the full audit-fix campaign below, 11 commits) into `main` and pushed to GitHub.
+- **Next:** daily-use validation in the user's real Chrome profile.
 
 ### 2026-06-10 — Full audit fix campaign + side panel root-cause
 - Fixed all findings from the prior full-codebase review ("ultrareview"), one verified commit per theme:
