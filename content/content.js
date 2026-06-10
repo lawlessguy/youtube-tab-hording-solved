@@ -115,11 +115,25 @@
 
   // --- Watch Time Tracking ---
 
+  // --- Settings (read from storage directly — no service worker round-trip) ---
+
+  let cachedSettings = null;
+
+  async function getSettings() {
+    if (cachedSettings) return cachedSettings;
+    try {
+      if (!isContextValid()) return {};
+      const r = await chrome.storage.local.get('yt_settings');
+      cachedSettings = r.yt_settings || {};
+    } catch { return {}; }
+    return cachedSettings;
+  }
+
   // --- Auto-apply stored volume/speed to new videos ---
 
   async function applyStoredSettings() {
     try {
-      const settings = await safeSend({ type: 'GET_SETTINGS' });
+      const settings = await getSettings();
       if (!settings) return;
       if (settings.volumeLevel !== undefined && settings.volumeLevel !== 100) {
         setVolume(settings.volumeLevel);
@@ -137,6 +151,8 @@
     video.addEventListener('loadeddata', () => applyStoredSettings());
   }
 
+  // Started once at init; the tick is a no-op without a playing video, so it
+  // is safe (and cheap) to run on pages that never get one
   function startTracking() {
     if (trackingInterval) clearInterval(trackingInterval);
     trackingInterval = setInterval(() => {
@@ -152,6 +168,22 @@
     }, 1000);
 
     setInterval(() => { if (isContextValid()) flushWatchTime(); }, FLUSH_INTERVAL);
+  }
+
+  // Bind the <video>-dependent features once the element exists. Retries are
+  // capped — the SPA navigation handler restarts them — so pages without a
+  // video (home, subscriptions) no longer spin a retry loop forever.
+  let videoBindTimer = null;
+
+  function bindVideoFeatures(attempt = 0) {
+    if (videoBindTimer) { clearTimeout(videoBindTimer); videoBindTimer = null; }
+    const video = getVideoElement();
+    if (!video) {
+      if (attempt < 15) {
+        videoBindTimer = setTimeout(() => bindVideoFeatures(attempt + 1), 1000);
+      }
+      return;
+    }
     setupEndedListener();
     setupAutoApply();
     applyStoredSettings();
@@ -289,11 +321,6 @@
         sendResponse({ success: true, paused: video.paused });
         break;
 
-      case 'YT_UI_UPDATE':
-        applyYouTubeUI();
-        sendResponse({ success: true });
-        break;
-
       default:
         sendResponse({});
     }
@@ -301,12 +328,6 @@
   });
 
   // --- YouTube UI Modifications ---
-
-  async function getSettings() {
-    try {
-      return await safeSend({ type: 'GET_SETTINGS' });
-    } catch { return {}; }
-  }
 
   async function applyYouTubeUI() {
     const settings = await getSettings();
@@ -571,11 +592,16 @@
     document.head.appendChild(style);
   }
 
+  function setQueuedIdsFrom(videos) {
+    knownQueuedIds = new Set(videos.filter(v => !v.watched).map(v => v.id));
+    knownWatchedIds = new Set(videos.filter(v => v.watched).map(v => v.id));
+  }
+
   async function refreshQueuedIds() {
     try {
-      const r = await safeSend({ type: 'GET_QUEUED_IDS' });
-      knownQueuedIds = new Set(r.ids || []);
-      knownWatchedIds = new Set(r.watched || []);
+      if (!isContextValid()) return;
+      const r = await chrome.storage.local.get('yt_videos');
+      setQueuedIdsFrom(r.yt_videos || []);
     } catch {}
   }
 
@@ -641,19 +667,48 @@
     safeSend({ type: 'TAG_STARRED', videoId, url: fullUrl });
   }, true);
 
+  // --- Event-driven refresh (replaces the old polling loops) ---
+
+  // Throttled, mutation-driven indicator/UI refresh: runs at most once per
+  // 1.5s and only while the page is actually mutating (lazy-loaded
+  // thumbnails, re-rendered sidebars). Idle pages cost nothing.
+  let indicatorRefreshPending = false;
+  function scheduleIndicatorRefresh() {
+    if (indicatorRefreshPending) return;
+    indicatorRefreshPending = true;
+    setTimeout(() => {
+      indicatorRefreshPending = false;
+      if (!isContextValid()) return;
+      applyThumbnailIndicators();
+      if (cachedSettings?.hideRecs) applyHideRecs(true);
+    }, 1500);
+  }
+
+  // Queue/settings changes arrive via storage.onChanged instead of polling
+  // the service worker — no messages, and the worker can stay asleep
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local') return;
+      if (changes.yt_videos) {
+        setQueuedIdsFrom(changes.yt_videos.newValue || []);
+        scheduleIndicatorRefresh();
+      }
+      if (changes.yt_settings) {
+        cachedSettings = changes.yt_settings.newValue || {};
+        applyYouTubeUI();
+      }
+    });
+  } catch {}
+
   // --- Initialization ---
 
   function init() {
     injectIndicatorStyles();
     refreshQueuedIds().then(applyThumbnailIndicators);
-    const video = getVideoElement();
-    if (video) {
-      startTracking();
-      setTimeout(reportMetadata, 3000);
-      setTimeout(applyYouTubeUI, 2000);
-    } else {
-      setTimeout(init, 1000);
-    }
+    startTracking();
+    bindVideoFeatures();
+    setTimeout(reportMetadata, 3000);
+    setTimeout(applyYouTubeUI, 2000);
   }
 
   // Watch for YouTube SPA navigation
@@ -673,25 +728,17 @@
       const sec = document.querySelector('.ytm-comments-sidebar');
       if (sec) sec.classList.remove('ytm-comments-sidebar');
       setTimeout(reportMetadata, 3000);
-      setTimeout(setupEndedListener, 3000);
-      setTimeout(setupAutoApply, 2000);
-      setTimeout(applyStoredSettings, 2000);
       setTimeout(applyYouTubeUI, 3000);
+      bindVideoFeatures();
     }
+    scheduleIndicatorRefresh();
   });
   observer.observe(document.body, { childList: true, subtree: true });
 
+  // beforeunload is unreliable in MV3 — pagehide catches the cases it misses
+  // (flushing twice is safe: the accumulator resets on flush)
   window.addEventListener('beforeunload', flushWatchTime);
-
-  // Re-apply YouTube UI modifications and thumbnail indicators periodically
-  setInterval(async () => {
-    if (!isContextValid()) return;
-    try {
-      const s = await getSettings();
-      if (s && s.hideRecs) applyHideRecs(true);
-    } catch {}
-    refreshQueuedIds().then(applyThumbnailIndicators);
-  }, 3000);
+  window.addEventListener('pagehide', flushWatchTime);
 
   init();
 })();

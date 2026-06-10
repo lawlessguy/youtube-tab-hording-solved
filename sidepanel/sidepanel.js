@@ -551,15 +551,14 @@ document.getElementById('tb-intercept').addEventListener('click', () => {
   msg({ type: 'UPDATE_SETTINGS', settings: { interceptEnabled: next } });
 });
 
+// Content scripts watch yt_settings via storage.onChanged, so saving the
+// setting is enough — no broadcast needed
 for (const [btnId, settingKey] of Object.entries(toggleMap)) {
   document.getElementById(btnId).addEventListener('click', e => {
     const btn = e.currentTarget;
     btn.classList.toggle('active');
     const enabled = btn.classList.contains('active');
     msg({ type: 'UPDATE_SETTINGS', settings: { [settingKey]: enabled } });
-    if (settingKey === 'showVideoInfo' || settingKey === 'hideRecs') {
-      broadcastToYouTubeTabs({ type: 'YT_UI_UPDATE' });
-    }
   });
 }
 
@@ -624,22 +623,6 @@ function setupDragDrop(container) {
 function updateSortUI() {
   document.querySelectorAll('.sort-btn').forEach(b => b.classList.toggle('active', b.dataset.sort === currentSort));
   document.getElementById('sort-direction').textContent = sortDirection === 'desc' ? '\u2193' : '\u2191';
-}
-
-// Host check, not substring — mirrors isYouTubeHost in utils/youtube.js
-// (plain script, can't import ES modules)
-function isYouTubeTab(url) {
-  try {
-    const host = new URL(url).hostname.toLowerCase();
-    return host === 'youtube.com' || host.endsWith('.youtube.com');
-  } catch { return false; }
-}
-
-async function broadcastToYouTubeTabs(message) {
-  const tabs = await chrome.tabs.query({});
-  for (const tab of tabs) {
-    if (isYouTubeTab(tab.url)) chrome.tabs.sendMessage(tab.id, message).catch(() => {});
-  }
 }
 
 // --- Search ---
@@ -735,8 +718,22 @@ document.getElementById('refresh-metadata').addEventListener('click', async () =
   loadVideos();
 });
 
-// Background updates
-chrome.runtime.onMessage.addListener(m => { if (m.type === 'VIDEOS_UPDATED') loadVideos(); });
+// Background updates — debounced: COLLECT_TABS and metadata enrichment emit
+// VIDEOS_UPDATED in bursts, and each loadVideos() is a full re-sort + render
+let loadVideosTimer = null;
+function scheduleLoadVideos() {
+  if (loadVideosTimer) return;
+  loadVideosTimer = setTimeout(() => {
+    loadVideosTimer = null;
+    loadVideos();
+  }, 150);
+}
+chrome.runtime.onMessage.addListener(m => { if (m.type === 'VIDEOS_UPDATED') scheduleLoadVideos(); });
+
+// Watch time updates arrive via storage instead of a 5s poll
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.yt_watch_time) loadWatchTime();
+});
 
 // --- Virtual Scroll Listener ---
 let scrollRafPending = false;
@@ -755,5 +752,4 @@ loadWatchTime();
 loadSettings();
 loadVideos();
 updateNowPlaying();
-setInterval(loadWatchTime, 5000);
 setInterval(updateNowPlaying, 1500);

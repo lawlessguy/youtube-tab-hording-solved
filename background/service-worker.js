@@ -15,6 +15,9 @@ const recentlyCreatedTabs = new Map();
 const extensionOpenedTabs = new Map();
 // Track the last tab that had a playing video (best-effort; loss is benign)
 let lastPlayingTabId = null;
+// Rate-limit the all-tabs media scan: the panel polls every 1.5s, and with
+// many YouTube tabs open a full scan per poll messages every one of them
+let lastFullMediaScanAt = 0;
 
 let sessionStateReady = null;
 function loadSessionState() {
@@ -725,14 +728,18 @@ async function handleMessage(message, sender) {
         }
       }
 
-      // 3. Scan all YouTube tabs for any playing video
-      const allTabs = await chrome.tabs.query({});
-      for (const t of allTabs) {
-        if (!isYouTubeHost(t.url)) continue;
-        const state = await queryTab(t.id);
-        if (state && !state.paused) {
-          lastPlayingTabId = t.id;
-          return state;
+      // 3. Scan all YouTube tabs for any playing video — at most once per
+      // 10s; once something is playing, step 2 finds it cheaply on every poll
+      if (Date.now() - lastFullMediaScanAt > 10000) {
+        lastFullMediaScanAt = Date.now();
+        const allTabs = await chrome.tabs.query({});
+        for (const t of allTabs) {
+          if (!isYouTubeHost(t.url)) continue;
+          const state = await queryTab(t.id);
+          if (state && !state.paused) {
+            lastPlayingTabId = t.id;
+            return state;
+          }
         }
       }
 
