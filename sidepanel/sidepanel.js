@@ -626,10 +626,19 @@ function updateSortUI() {
   document.getElementById('sort-direction').textContent = sortDirection === 'desc' ? '\u2193' : '\u2191';
 }
 
+// Host check, not substring — mirrors isYouTubeHost in utils/youtube.js
+// (plain script, can't import ES modules)
+function isYouTubeTab(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === 'youtube.com' || host.endsWith('.youtube.com');
+  } catch { return false; }
+}
+
 async function broadcastToYouTubeTabs(message) {
   const tabs = await chrome.tabs.query({});
   for (const tab of tabs) {
-    if (tab.url?.includes('youtube.com')) chrome.tabs.sendMessage(tab.id, message).catch(() => {});
+    if (isYouTubeTab(tab.url)) chrome.tabs.sendMessage(tab.id, message).catch(() => {});
   }
 }
 

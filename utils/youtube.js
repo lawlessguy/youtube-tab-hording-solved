@@ -1,7 +1,25 @@
 import { YOUTUBE_URL_PATTERNS } from './constants.js';
 
+// Hostname allowlist — substring checks like url.includes('youtube.com')
+// match hostile URLs (https://fakeyoutube.com.evil.tld/,
+// https://evil.tld/youtube.com/watch?v=...) and would let them into the
+// queue, the tab-close paths, and the side panel enablement logic.
+const YOUTUBE_HOSTS = new Set([
+  'youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com',
+]);
+
+export function isYouTubeHost(url) {
+  if (!url) return false;
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return YOUTUBE_HOSTS.has(host) || host === 'youtu.be';
+  } catch {
+    return false;
+  }
+}
+
 export function extractVideoId(url) {
-  if (!url) return null;
+  if (!isYouTubeHost(url)) return null;
   const shortMatch = url.match(YOUTUBE_URL_PATTERNS.SHORT);
   if (shortMatch) return shortMatch[1];
   const videoMatch = url.match(YOUTUBE_URL_PATTERNS.VIDEO);
@@ -10,15 +28,14 @@ export function extractVideoId(url) {
 }
 
 export function isYouTubeUrl(url) {
-  if (!url) return false;
-  return url.includes('youtube.com/watch') ||
+  if (!isYouTubeHost(url)) return false;
+  return url.includes('/watch') ||
          url.includes('youtu.be/') ||
-         url.includes('youtube.com/shorts/');
+         url.includes('/shorts/');
 }
 
 export function isShortUrl(url) {
-  if (!url) return false;
-  return url.includes('youtube.com/shorts/');
+  return isYouTubeHost(url) && url.includes('/shorts/');
 }
 
 export function getThumbnailUrl(videoId, quality = 'mqdefault') {

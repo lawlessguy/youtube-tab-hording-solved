@@ -1,7 +1,7 @@
 import { STORAGE_KEYS, DEFAULT_SETTINGS, DEFAULT_CATEGORIES, MSG } from '../utils/constants.js';
 import * as storage from '../utils/storage.js';
 import {
-  extractVideoId, isYouTubeUrl, isShortUrl,
+  extractVideoId, isYouTubeUrl, isShortUrl, isYouTubeHost,
   fetchVideoMetadata, fetchVideoDetails, getThumbnailUrl
 } from '../utils/youtube.js';
 
@@ -98,7 +98,7 @@ chrome.runtime.onInstalled.addListener(async () => {
 // --- Side Panel Visibility (hide on non-YouTube tabs) ---
 
 function updateSidePanelForTab(tabId, url) {
-  const isYouTube = url && url.includes('youtube.com');
+  const isYouTube = isYouTubeHost(url);
   chrome.sidePanel.setOptions({ tabId, enabled: isYouTube }).catch(() => {});
 }
 
@@ -344,7 +344,7 @@ async function applyMediaControl(type, value, scope) {
   for (const tab of tabs) {
     if (!tab.url) continue;
 
-    if (tab.url.includes('youtube.com')) {
+    if (isYouTubeHost(tab.url)) {
       // YouTube: use content script
       try {
         await chrome.tabs.sendMessage(tab.id, { type: msgType, value });
@@ -702,7 +702,7 @@ async function handleMessage(message, sender) {
 
       // 1. Check active tab — if it's playing, it takes priority
       const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      if (activeTab?.url?.includes('youtube.com')) {
+      if (isYouTubeHost(activeTab?.url)) {
         const state = await queryTab(activeTab.id);
         if (state && !state.paused) {
           lastPlayingTabId = activeTab.id;
@@ -714,7 +714,7 @@ async function handleMessage(message, sender) {
       if (lastPlayingTabId) {
         try {
           const tab = await chrome.tabs.get(lastPlayingTabId);
-          if (tab?.url?.includes('youtube.com')) {
+          if (isYouTubeHost(tab?.url)) {
             const state = await queryTab(lastPlayingTabId);
             if (state && !state.paused) {
               return state;
@@ -728,7 +728,7 @@ async function handleMessage(message, sender) {
       // 3. Scan all YouTube tabs for any playing video
       const allTabs = await chrome.tabs.query({});
       for (const t of allTabs) {
-        if (!t.url?.includes('youtube.com')) continue;
+        if (!isYouTubeHost(t.url)) continue;
         const state = await queryTab(t.id);
         if (state && !state.paused) {
           lastPlayingTabId = t.id;
@@ -737,7 +737,7 @@ async function handleMessage(message, sender) {
       }
 
       // 4. Nothing playing — check active tab for paused state (so card shows if on a YT tab)
-      if (activeTab?.url?.includes('youtube.com')) {
+      if (isYouTubeHost(activeTab?.url)) {
         const state = await queryTab(activeTab.id);
         if (state) {
           return state;
@@ -784,7 +784,7 @@ async function handleMessage(message, sender) {
     case MSG.OPEN_VIDEO: {
       // Smart open: replace current YT tab or open new tab
       const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      if (activeTab && activeTab.url && activeTab.url.includes('youtube.com')) {
+      if (activeTab && isYouTubeHost(activeTab.url)) {
         await whitelistExtensionTab(activeTab.id, 5000);
         await chrome.tabs.update(activeTab.id, { url: message.url });
         return { tabId: activeTab.id, replaced: true };
@@ -855,12 +855,12 @@ async function handleMessage(message, sender) {
       if (message.tabId) {
         try {
           const tab = await chrome.tabs.get(message.tabId);
-          if (tab?.url?.includes('youtube.com')) targetId = tab.id;
+          if (isYouTubeHost(tab?.url)) targetId = tab.id;
         } catch {}
       }
       if (!targetId) {
         const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-        if (activeTab?.url?.includes('youtube.com')) targetId = activeTab.id;
+        if (isYouTubeHost(activeTab?.url)) targetId = activeTab.id;
       }
       if (targetId) {
         try {
@@ -914,12 +914,12 @@ async function handleMessage(message, sender) {
         if (message.tabId) {
           try {
             const tab = await chrome.tabs.get(message.tabId);
-            if (tab?.url?.includes('youtube.com')) targetTab = tab;
+            if (isYouTubeHost(tab?.url)) targetTab = tab;
           } catch {}
         }
         if (!targetTab) {
           const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-          if (activeTab?.url?.includes('youtube.com')) targetTab = activeTab;
+          if (isYouTubeHost(activeTab?.url)) targetTab = activeTab;
         }
         if (targetTab) {
           await whitelistExtensionTab(targetTab.id, 5000);
