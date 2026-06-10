@@ -9,19 +9,25 @@ Chrome Manifest V3 extension — "YouTube Tab Manager". Manages YouTube video qu
 ## Commands
 
 - `npm test` — Run Playwright headless smoke tests (loads extension in Chromium, screenshots to `screenshots/`)
-- `npm run test:headed` — Same but visible browser
-- `npm run test:debug` — Headed + browser stays open for inspection
+- `npm run test:all` — Full headless chain: smoke + all 14 targeted suites below
+- `npm run test:headed` — Smoke tests with visible browser; `test:debug` keeps it open
 - `npm run generate-icons` — Regenerate PNG icons from `scripts/generate-icons.js`
-- Targeted suites (all headless, run with `node tests/<file>`):
-  - `test-races.js` — concurrent storage mutation correctness (lost updates, duplicate queue entries)
-  - `test-virtual-scroll.js` — side panel virtual scroller (bounded DOM, correct window, node reuse)
-  - `test-media-routing.js` — GET_MEDIA_STATE tabId + MEDIA_CONTROL routing (live YouTube page)
-  - `test-tab-management.js` — duplicate removal, panel enablement, intercept guards (live tabs)
-  - `test-url-validation.js` — hostile lookalike URLs stay out of queue/stats
-  - `test-event-driven.js` — storage.onChanged badge/watch-time propagation (routed fake YouTube page)
-  - `test-panel-gesture.js` — side panel opens from a trusted click with zero worker errors
-  - `test-panel-live.js` — manual headed E2E: real YouTube tab, real side panel, pixel-level visibility check, desktop screenshot to `screenshots/live-panel.png`
-  - `test-indicators.js` — manual headed test for thumbnail badges on real YouTube
+- Targeted headless suites (npm script in parentheses):
+  - `test-races.js` (`test:races`) — concurrent storage mutation correctness (lost updates, duplicate queue entries)
+  - `test-virtual-scroll.js` (`test:scroll`) — side panel virtual scroller (bounded DOM, correct window, node reuse)
+  - `test-media-routing.js` (`test:media`) — GET_MEDIA_STATE tabId + MEDIA_CONTROL routing (live YouTube page)
+  - `test-tab-management.js` (`test:tabs`) — duplicate removal, panel enablement, intercept guards, middle-click survival
+  - `test-url-validation.js` (`test:urls`) — hostile lookalike URLs stay out of queue/stats
+  - `test-event-driven.js` (`test:events`) — storage.onChanged badge/watch-time propagation (routed fake YouTube page)
+  - `test-panel-gesture.js` (`test:gesture`) — side panel opens from a trusted click with zero worker errors
+  - `test-status-indicators.js` (`test:indicators-status`) — open-tab TAB chips, addCount chips, card geometry guard
+  - `test-sessions.js` (`test:sessions`) — session CRUD/merge/switch, per-session queues, channel filter, smart play
+  - `test-analytics.js` (`test:analytics`) — activity log shape/rotation/capture, suggested sort, export
+  - `test-player.js` (`test:player`) — speed sync, drag-resizable player, timeline seek history
+  - `test-viewing-modes.js` (`test:modes`) — in-page masthead queue strip + slim panel mode
+  - `test-pip.js` (`test:pip`) — PiP controls row, auto-PiP wiring, Document-PiP fallback rules
+  - `test-shorts.js` (`test:shorts`) — shorts tools strip, left rail, in-panel player, auto-scroll/auto-close
+- Headed/manual live checks against real YouTube (NOT in `test:all`): `test:panel-live`, `test:player-live`, `test:viewing-live`, `test:pip-live`, `test:shorts-live`, plus `node tests/test-indicators.js`
 
 ## Architecture
 
@@ -40,10 +46,19 @@ All state lives in `chrome.storage.local`. UI surfaces communicate through `chro
 
 **Every storage mutation MUST go through `storage.update(key, fn)`** (utils/storage.js) — it serializes read-modify-writes on a single queue. Raw get-then-set races with concurrent writers and silently loses updates (this was a real bug class: duplicate queue entries on session restore, lost watch minutes). Keep network fetches OUTSIDE the update callback; returning `undefined` from the callback skips the write.
 
+**Sessions model:** `yt_videos` is ONE array for ALL sessions. Each element carries `sessionId` (missing ⇒ `'main'` — every consumer applies `v.sessionId || 'main'`) and `addCount` (missing ⇒ 1). The same videoId may exist once PER session; the duplicate check in `addVideoToQueue` is session-scoped. `yt_sessions` (`{activeId, list:[{id,name,createdAt}]}`) is worker-written only and the `'main'` entry always exists. `MARK_WATCHED` (and the mark inside `SKIP_VIDEO`) marks ALL entries with that videoId across sessions. Q/W badges on YouTube are session-agnostic (union over all sessions); the panel and the in-page queue strip show the ACTIVE session only.
+
+**Queue inserts** all go through `addVideoToQueue(url, videoId, explicitTimestamp, starred, opts)` with `opts = { bumpCount=true, source='manual', sessionId=<active> }`. The bump-existing path (same session) updates `addedAt` and increments `addCount` only when `bumpCount`; COLLECT_TABS passes `bumpCount:false`. `source` feeds the `added_to_queue` activity event.
+
+**Open-tab ids:** `yt_open_tab_ids` lives in `chrome.storage.session` — sorted unique videoIds of open tabs. Worker-only writer, recomputed event-driven from `tabs.query` (tab create/navigate/remove/replace + worker wake) with a 250ms debounce, written only when the set actually differs. Deliberately OUTSIDE the storage.update mutex (that mutex serializes local only; this value is derived ground truth) — do not route it through storage.update. The panel reacts via `storage.onChanged(area === 'session')`.
+
+**Activity log:** `yt_activity_log` (`{v:1, seq, events[]}`, 5000-event FIFO cap, `seq` monotonic across rotation) is appended worker-side via `logActivity()` in `utils/activity-log.js` — best-effort, issues its own storage.update, must be called sequentially AFTER a caller's own update completes, never from inside an update callback. Suggested-sort scores are cached in `yt_suggest_scores` keyed to `computedAtSeq` (stale seq forces recompute).
+
 Key flows:
 - Side panel → `MSG.GET_VIDEOS` → service worker reads storage → returns array
 - Content script → `MSG.MARK_WATCHED` → service worker updates storage → broadcasts `VIDEOS_UPDATED` (panel debounces these — enrichment fires them in bursts)
 - Side panel → `MSG.MEDIA_CONTROL` (+ `tabId` from the last `GET_MEDIA_STATE`) → service worker → `chrome.tabs.sendMessage` to THAT tab → content script controls `<video>`
+- `GET_MEDIA_STATE` final shape (content response, worker passthrough AND the worker's empty fallback — every field, false/null defaults): `{ paused, currentTime, duration, videoId, tabId, isShorts, url, pipActive, docPipSupported }`. Extend it, never trim it.
 - Settings/queue changes propagate to content scripts via `chrome.storage.onChanged` — there is deliberately no polling and no `YT_UI_UPDATE`-style broadcast
 
 ### Tab Interception
@@ -57,16 +72,22 @@ New YouTube tabs are caught via `chrome.tabs.onCreated` + `chrome.tabs.onUpdated
 - Video-feature binding retries are capped (15 × 1s) and restarted by the SPA navigation handler — no infinite init loops on pages without a `<video>`
 - Upload date extracted from `<script type="application/ld+json">` structured data
 - Settings auto-applied on `loadeddata` event of `<video>` element
+- Injected surfaces beyond badges: in-page queue strip in the masthead (`inPageQueue`, active session only, reacts to `onChanged` of `yt_sessions` + `yt_videos`), drag-resize handles on the player (`playerResizeEnabled`), shorts left rail on `/shorts/` pages
 - A video is marked watched at 20% progress
 
 ### Side Panel Layout
 
-- `.sticky-top` (flex-shrink: 0) — header, toggle bar, sliders, sort/filter, content tabs (media controls live in the now-playing card inside the scroll area)
+- `.sticky-top` (flex-shrink: 0) — header, session bar, toggle bars, sliders, shorts tools, sort/filter, channel chip, content tabs (media controls live in the now-playing card inside the scroll area)
+- Toggle bar has TWO rows: row 1 (Collect/Close/Intercept/Autoplay/Info/Hide) and `.toggle-bar--secondary` (`#tb-inpage` Strip · `#tb-resize` Resize · `#tb-autopip` PiP · `#tb-export` Export) — new buttons go in row 2, in that established order
 - `.scroll-area` (flex: 1, overflow-y: auto, **position: relative — load-bearing**: the virtual scroller measures card windows via `offsetTop`, which must be relative to this scroll container)
-- Video lists are virtualized: `CARD_HEIGHT = 63` must equal `.video-item` height (59px) + margin-bottom (4px); change them together
+- `#shorts-player` must stay the FIRST child of `.scroll-area` (scroller re-measures offsetTop under it); `#shorts-tools` strip sits after `.controls-bar` and is hidden unless the displayed tab is a Short
+- Video lists are virtualized: ALL geometry math goes through the `cardHeight()` accessor — 63 in full mode (59px `.video-item` + 4px margin), 94 in slim (90 + 4). Never hardcode 63 in new code; change CSS heights and the constants together
+- Slim mode (`panelMode: 'slim'`, `body.slim`) hides most of `.sticky-top` and shows thumbnail-only tiles — the TAB/addCount chips must stay visible (hover overlay must not cover the top 14px of the thumb)
+- Card chips: `.thumb-tab-badge` top-LEFT, `.thumb-addcount` top-RIGHT (both pointer-events:none), `.thumb-duration` bottom-right
 - Videos/Shorts shown via content tabs (only one visible at a time)
 - DOM built with safe `el()` helper — no `innerHTML` with user data (security hook enforced)
 - Re-renders are suppressed while a card drag is in progress (a rebuild destroys the dragged node and orphans the drop)
+- **No `prompt()`/`confirm()` in the panel** — use inline inputs + two-click confirms (session bar pattern)
 
 ## Key Gotchas
 
@@ -80,9 +101,14 @@ New YouTube tabs are caught via `chrome.tabs.onCreated` + `chrome.tabs.onUpdated
 - Side panel visibility per-tab: `chrome.sidePanel.setOptions({ tabId, enabled: boolean })` — kept in sync on activation AND same-tab navigation; the popup's open button re-enables before opening
 - Volume for non-YouTube tabs uses `chrome.scripting.executeScript` (requires `scripting` permission + `<all_urls>`)
 - Volume slider (0–1000) and speed slider (1–100) are scaled so both defaults (100%, 1.0x) sit at 10% of range — keep ranges proportional when modifying (speed min is 1: `playbackRate = 0` freezes the video)
-- Toggle bar buttons use `data-desc` attribute for hover descriptions shown in `#toggle-desc`; any new button in `.toggle-bar` must include `data-desc`. The JS listener targets `.toggle-bar [data-desc]` — description persists after mouse leaves (no `mouseleave` reset).
-- Re-opening a video already in the queue updates its `addedAt` to current time (bumps to top of "Added" sort)
-- Every tab-closing path (`CLOSE_SHORTS_TABS`, `CLOSE_VISIBLE_TABS`, `REMOVE_DUPLICATES`, intercept 'close') preserves the active tab — never close what the user is watching
+- `speedLevel` may hold ANY value in [0.1, 10] (YouTube's own menu, arrow-key steps). Panel + popup render labels via the shared `fmtSpeed(v)` helper (≤2 decimals) and set slider thumbs with `Math.round(v*10)`; content broadcasts external changes via `SPEED_CHANGED`
+- Toggle bar buttons use `data-desc` attribute for hover descriptions shown in `#toggle-desc`; any new button in either `.toggle-bar` row or `.shorts-tools` must include `data-desc`. The JS listener targets `.toggle-bar [data-desc], .shorts-tools [data-desc]` — description persists after mouse leaves (no `mouseleave` reset).
+- Re-opening a video already in the queue (same session) updates its `addedAt` to current time (bumps to top of "Added" sort) and increments `addCount`
+- Every tab-closing path (`CLOSE_SHORTS_TABS`, `CLOSE_VISIBLE_TABS`, `REMOVE_DUPLICATES`, intercept 'close') preserves the active tab — never close what the user is watching. The ONE sanctioned exception: shorts auto-close (`CLOSE_SHORT_TAB`) closes the validated SENDER tab when its Short ends, and only while `shortsAutoClose` is enabled
+- `sortBy: 'suggested'` is computed panel-side from `GET_SUGGEST_SCORES` (worker fallback sorts treat it as `addedAt`); drag-reorder is disabled while it is active
+- Document PiP bails out to classic video PiP whenever `audioContext` exists — the volume-boost `createMediaElementSource` chain silences a video moved into another document. While the player floats in Doc-PiP the resize handles no-op (the on-page container holds a placeholder), and `getVideoElement()` searches the PiP document so timeline-history/speed-sync keep working on the floated video
+- Auto-PiP (`pipAutoEnabled`) rides MediaSession `enterpictureinpicture` — Chrome decides eligibility and shows its own prompt on first use; the call is gesture-free only inside that handler
+- Content-script `<head>` CSS injection order is load-bearing: hideRecs style → resize style → anything later. Resize wins specificity with doubled-id selectors; later styles must not `!important`-override player sizing
 - PowerShell 5.1 `Get-Content`/`Set-Content` mangles this repo's UTF-8 files (em-dashes/arrows become mojibake) — use proper editing tools, not shell pipelines, for source edits
 
 <!-- progress-journal -->
