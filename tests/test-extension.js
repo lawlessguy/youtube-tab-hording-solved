@@ -145,6 +145,11 @@ async function run() {
   check('Strip toggle inactive by default (inPageQueue false)',
     await sidePanel.evaluate(() => !document.getElementById('tb-inpage').classList.contains('active')));
 
+  // Shorts (stage 07): tools strip (hidden until a Short is displayed) + the
+  // in-panel player slot at the top of the scroll area
+  check('Shorts tools strip present', !!(await sidePanel.$('#shorts-tools')));
+  check('Shorts player slot present', !!(await sidePanel.$('#shorts-player')));
+
   await sidePanel.screenshot({ path: path.join(screenshotDir, 'sidepanel.png') });
   console.log('  Screenshot: screenshots/sidepanel.png');
 

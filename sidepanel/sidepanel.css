@@ -557,6 +557,40 @@ body.slim .video-item:hover .card-right { opacity: 1; }
 body.slim .video-item.drag-over { border-top: 2px solid var(--accent); }
 body.slim .content-tab { padding: 4px 0; font-size: 11px; }
 
+/* --- Shorts tools strip (stage 07) — visible only when the displayed tab is a Short --- */
+.shorts-tools { display: flex; gap: 4px; padding: 5px 0; border-bottom: 1px solid var(--border); }
+.st-btn { flex: 1; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 2px; padding: 4px 2px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg-card); color: var(--text2);
+  cursor: pointer; transition: all 0.15s; min-height: 32px; }
+.st-btn:hover { color: var(--text); border-color: #555; background: var(--bg-hover); }
+.st-btn.active { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+
+/* In-panel Shorts player (stage 07) */
+#shorts-player { margin-bottom: 6px; }
+.sp-card { background: var(--bg-card); border: 1px solid var(--accent);
+  border-radius: var(--r); padding: 8px; box-shadow: 0 0 8px rgba(255,0,0,0.08); }
+.sp-head { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.sp-title { flex: 1; font-size: 12px; font-weight: 600; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.sp-head .card-sm-btn { flex-shrink: 0; }
+.sp-frame-wrap { display: flex; justify-content: center; }
+.sp-frame-wrap iframe { width: 264px; height: 470px; border: 0; border-radius: 8px; background: #000; }
+.sp-error { width: 264px; height: 470px; border-radius: 8px; background: #000;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; color: var(--text2); font-size: 12px; text-align: center; padding: 12px; box-sizing: border-box; }
+.sp-error button { background: var(--accent-dim); border: 1px solid var(--accent);
+  color: var(--text); border-radius: 5px; padding: 5px 12px; font-size: 12px;
+  cursor: pointer; transition: all 0.15s; }
+.sp-error button:hover { background: var(--accent); color: #fff; }
+.sp-nav { display: flex; align-items: center; justify-content: center; gap: 8px;
+  padding-top: 6px; margin-top: 6px; border-top: 1px solid var(--border); }
+.sp-pos { font-size: 10px; color: var(--text2); font-variant-numeric: tabular-nums; }
+.sp-nav .np-btn[disabled] { opacity: 0.35; cursor: default; }
+
+/* Per-card open-in-panel button (shorts only) — must not change the 59px card height */
+.card-panel-btn { font-size: 9px; }
+
 /* Scrollbar */
 ::-webkit-scrollbar { width: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }

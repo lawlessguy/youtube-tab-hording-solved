@@ -31,6 +31,13 @@
   let seekFinalizeTimer = null;
   let suppressSeekRecording = false; // our own undo/redo seeks aren't recorded
   let seekHistoryVideoId = null;
+  // Shorts (stage 07): arrow scrubbing + first-loop-boundary finish detection
+  const SHORTS_SEEK_SECONDS = 5;
+  let lastManualSeekAt = 0;   // suppress loop-detect right after a seek
+  let prevShortTime = 0;      // last observed currentTime on the shorts <video>
+  let lastLoopFiredId = null; // finish fires once per videoId
+
+  function isShortsPage() { return location.pathname.startsWith('/shorts/'); }
 
   // Check if the extension context is still valid (becomes invalid after reload/update)
   function isContextValid() {
@@ -266,6 +273,12 @@
         type: 'VIDEO_ENDED',
         videoId: videoId || undefined,
       });
+      // Shorts fallback (stage 07): a non-looping Short fires 'ended' instead
+      // of a loop boundary — same once-per-id guard as the loop watcher
+      if (isShortsPage() && videoId && videoId !== lastLoopFiredId) {
+        lastLoopFiredId = videoId;
+        handleShortFinished(videoId);
+      }
     });
   }
 
@@ -362,6 +375,7 @@
       return;
     }
     setupEndedListener();
+    setupShortsLoopWatch();
     setupAutoApply();
     bindRateSync(video);
     bindSeekHistory(video);
@@ -493,6 +507,10 @@
           currentTime: video ? video.currentTime : 0,
           duration: video && isFinite(video.duration) ? video.duration : 0,
           videoId: getCurrentVideoId(),
+          // Stage 07: the panel adapts its tools when the displayed tab is a
+          // Short (contract section 3 final shape)
+          isShorts: isShortsPage(),
+          url: window.location.href,
           // Stage 03: classic PiP element OR our Document PiP window open;
           // the panel greys its pip-row knobs when docPipSupported is false
           pipActive: !!docPipWindow || !!document.pictureInPictureElement,
@@ -511,6 +529,14 @@
           sendResponse({ success: true });
           break;
         }
+        // Shorts feed navigation (stage 07) — clicks YouTube's own nav
+        // buttons, so no <video> element is required
+        if (message.action === 'shortsNext' || message.action === 'shortsPrev') {
+          const ok = isShortsPage() &&
+            clickShortsNav(message.action === 'shortsNext' ? 'next' : 'prev');
+          sendResponse({ success: ok });
+          break;
+        }
         if (!video) { sendResponse({ success: false }); break; }
         // Optional seconds override for forward/rewind (contract, default 10)
         const secs = typeof message.seconds === 'number' && isFinite(message.seconds) &&
@@ -525,10 +551,16 @@
             video.play();
             break;
           case 'forward':
-            video.currentTime = Math.min(video.currentTime + secs, video.duration || Infinity);
+            // Clamp BELOW duration so a forward seek on a looping Short can't
+            // wrap the loop and false-fire the finish detector (stage 07)
+            video.currentTime = Math.min(video.currentTime + secs,
+              isFinite(video.duration) && video.duration > 0
+                ? Math.max(0, video.duration - 0.25) : Infinity);
+            lastManualSeekAt = Date.now();
             break;
           case 'rewind':
             video.currentTime = Math.max(video.currentTime - secs, 0);
+            lastManualSeekAt = Date.now();
             break;
           default:
             handled = false; // unknown actions respond {success:false} — never throw
@@ -802,6 +834,210 @@
       }
     } catch {} // TypeError on Chrome < 134 (unknown action) — degrade silently
   }
+
+  // --- Shorts Tools (stage 07) ---
+  // Arrow scrubbing, first-loop-boundary finish detection (auto-scroll /
+  // auto-close), programmatic feed navigation, and the in-page button rail.
+
+  // Arrow-key scrubbing — /shorts/ paths only, capture phase so we run before
+  // YouTube's document-level hotkeys (Shorts binds nothing to Left/Right
+  // natively today). Bails in text contexts and when any modifier is held
+  // (Alt+Left = history back must keep working).
+  window.addEventListener('keydown', (e) => {
+    if (!isShortsPage()) return;
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    const t = e.target;
+    if (t && (t.isContentEditable ||
+        /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || '') ||
+        (t.closest && t.closest('input, textarea, select, [contenteditable], #contenteditable-root, tp-yt-paper-dialog')))) return;
+    const video = getVideoElement();
+    if (!video) return;
+    e.preventDefault();
+    e.stopImmediatePropagation(); // win over YouTube's own listeners
+    seekBy(video, e.key === 'ArrowRight' ? SHORTS_SEEK_SECONDS : -SHORTS_SEEK_SECONDS);
+  }, true);
+
+  function seekBy(video, delta) {
+    lastManualSeekAt = Date.now();
+    // Clamp BELOW duration so a forward seek can't wrap the loop and
+    // false-trigger the finish detector
+    const max = isFinite(video.duration) ? Math.max(0, video.duration - 0.25) : Infinity;
+    video.currentTime = Math.min(Math.max(0, video.currentTime + delta), max);
+  }
+
+  // First loop boundary = "finished": previous observed currentTime within
+  // 0.75s of duration, new one < 0.5s, and no manual seek in the last 1.5s.
+  // Fires at most once per videoId (reset on SPA navigation).
+  function setupShortsLoopWatch() {
+    const video = getVideoElement();
+    if (!video || video._ytmLoopBound) return; // Shorts reuse one <video> across items
+    video._ytmLoopBound = true;
+    video.addEventListener('timeupdate', () => {
+      const t = video.currentTime, d = video.duration;
+      if (!isShortsPage()) { prevShortTime = t; return; }
+      const wrapped = isFinite(d) && d > 1 &&
+        prevShortTime > d - 0.75 && t < 0.5 &&
+        Date.now() - lastManualSeekAt > 1500;
+      prevShortTime = t;
+      if (!wrapped) return;
+      const id = getCurrentVideoId();
+      if (!id || id === lastLoopFiredId) return;
+      lastLoopFiredId = id;
+      handleShortFinished(id);
+    });
+  }
+
+  async function handleShortFinished(videoId) {
+    const s = await getSettings(); // cachedSettings, refreshed by storage.onChanged
+    if (s.shortsAutoClose) {
+      // Worker closes THIS tab only (sender-validated + isShortUrl-checked)
+      safeSend({ type: 'CLOSE_SHORT_TAB', videoId });
+    } else if (s.shortsAutoScroll) {
+      clickShortsNav('next');
+    }
+  }
+
+  function clickShortsNav(dir) {
+    const sel = dir === 'next'
+      ? '#navigation-button-down button, button[aria-label="Next video"]'
+      : '#navigation-button-up button, button[aria-label="Previous video"]';
+    const btn = document.querySelector(sel);
+    if (btn) { btn.click(); return true; }
+    // Fallback (untrusted — YouTube may ignore it; primary path is the click)
+    document.dispatchEvent(new KeyboardEvent('keydown', {
+      key: dir === 'next' ? 'ArrowDown' : 'ArrowUp',
+      code: dir === 'next' ? 'ArrowDown' : 'ArrowUp',
+      keyCode: dir === 'next' ? 40 : 38, which: dir === 'next' ? 40 : 38, bubbles: true,
+    }));
+    return false;
+  }
+
+  // --- In-page Shorts rail — fixed to the left viewport gutter ---
+
+  const RAIL_ID = 'ytm-shorts-rail';
+
+  function updateShortsFeatures() {
+    if (isShortsPage()) ensureShortsRail();
+    else removeShortsRail();
+  }
+
+  function injectShortsRailStyle() {
+    if (document.getElementById('ytm-shorts-rail-style')) return;
+    const style = document.createElement('style');
+    style.id = 'ytm-shorts-rail-style';
+    style.textContent = `
+      #ytm-shorts-rail { position: fixed; left: 14px; top: 50%; transform: translateY(-50%);
+        display: flex; flex-direction: column; gap: 10px; z-index: 2400; }
+      /* Clear YouTube's left guide when it is open (the rail is body-appended
+         after ytd-app, so the sibling combinator applies; if YouTube renames
+         these attributes the rail degrades to the 14px gutter) */
+      ytd-app[mini-guide-visible] ~ #ytm-shorts-rail { left: 86px; }
+      ytd-app[guide-persistent-and-visible] ~ #ytm-shorts-rail { left: 254px; }
+      #ytm-shorts-rail button { width: 40px; height: 40px; border-radius: 50%;
+        border: 1px solid rgba(255,255,255,0.25); background: rgba(30,30,30,0.85);
+        color: #f1f1f1; cursor: pointer; display: flex; align-items: center;
+        justify-content: center; font-size: 16px; padding: 0; }
+      #ytm-shorts-rail button:hover { background: rgba(60,60,60,0.95); }
+      #ytm-shorts-rail button.ytm-on { border-color: #ff0000; color: #ff0000;
+        background: rgba(255,0,0,0.15); }
+      #ytm-shorts-rail button.ytm-ok { border-color: #2ba640; color: #2ba640; }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function flashRailButton(btn) {
+    btn.classList.add('ytm-ok');
+    setTimeout(() => btn.classList.remove('ytm-ok'), 800);
+  }
+
+  // Static SVG icon strings only — never user data near innerHTML
+  const RAIL_ICONS = {
+    add: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+    star: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>',
+    next: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>',
+    autoscroll: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 11 12 17 18 11"/><line x1="12" y1="3" x2="12" y2="15"/></svg>',
+    autoclose: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>',
+  };
+
+  function ensureShortsRail() {
+    injectShortsRailStyle();
+    const existing = document.getElementById(RAIL_ID);
+    if (existing && existing.isConnected) { updateShortsRailState(); return; }
+    if (existing) existing.remove();
+
+    const rail = document.createElement('div');
+    rail.id = RAIL_ID;
+
+    const mkBtn = (id, icon, title) => {
+      const b = document.createElement('button');
+      b.id = id;
+      b.title = title;
+      b.innerHTML = RAIL_ICONS[icon]; // static SVG — allowed
+      rail.appendChild(b);
+      return b;
+    };
+
+    const addBtn = mkBtn('ytm-rail-add', 'add', 'Add this Short to the queue');
+    addBtn.addEventListener('click', () => {
+      // Contract section 4: shorts-rail adds carry source 'shorts'
+      safeSend({ type: 'ADD_VIDEO', url: window.location.href, source: 'shorts' })
+        .then(() => flashRailButton(addBtn));
+    });
+
+    const starBtn = mkBtn('ytm-rail-star', 'star', 'Star this Short');
+    starBtn.addEventListener('click', () => {
+      const videoId = getCurrentVideoId();
+      if (!videoId) return;
+      safeSend({ type: 'TAG_STARRED', videoId, url: window.location.href })
+        .then(() => flashRailButton(starBtn));
+    });
+
+    mkBtn('ytm-rail-next', 'next', 'Next Short')
+      .addEventListener('click', () => clickShortsNav('next'));
+
+    // Toggles repaint ONLY from storage.onChanged (no optimistic class flip),
+    // so the rail and the panel strip can never disagree. Mutually exclusive:
+    // turning one on writes the other off in the same UPDATE_SETTINGS.
+    const scrollBtn = mkBtn('ytm-rail-autoscroll', 'autoscroll', 'Auto-scroll to the next Short when this one finishes');
+    scrollBtn.addEventListener('click', () => {
+      const on = !cachedSettings?.shortsAutoScroll;
+      safeSend({ type: 'UPDATE_SETTINGS', settings: {
+        shortsAutoScroll: on, ...(on ? { shortsAutoClose: false } : {}),
+      } });
+    });
+
+    const closeBtn = mkBtn('ytm-rail-autoclose', 'autoclose', 'Close this tab when the Short finishes');
+    closeBtn.addEventListener('click', () => {
+      const on = !cachedSettings?.shortsAutoClose;
+      safeSend({ type: 'UPDATE_SETTINGS', settings: {
+        shortsAutoClose: on, ...(on ? { shortsAutoScroll: false } : {}),
+      } });
+    });
+
+    document.body.appendChild(rail);
+    updateShortsRailState();
+  }
+
+  function removeShortsRail() {
+    const rail = document.getElementById(RAIL_ID);
+    if (rail) rail.remove();
+  }
+
+  function updateShortsRailState() {
+    const rail = document.getElementById(RAIL_ID);
+    if (!rail) return;
+    rail.querySelector('#ytm-rail-autoscroll')
+      ?.classList.toggle('ytm-on', !!cachedSettings?.shortsAutoScroll);
+    rail.querySelector('#ytm-rail-autoclose')
+      ?.classList.toggle('ytm-on', !!cachedSettings?.shortsAutoClose);
+  }
+
+  // Hide the rail in fullscreen (it would float over the video)
+  document.addEventListener('fullscreenchange', () => {
+    const rail = document.getElementById(RAIL_ID);
+    if (rail) rail.style.display = document.fullscreenElement ? 'none' : '';
+  });
 
   // --- YouTube UI Modifications ---
 
@@ -1621,6 +1857,7 @@
         renderInPageQueueFrom(lastKnownVideos); // sort changes re-order tiles
         syncAutoPip(cachedSettings);            // auto-PiP toggle (stage 03)
         applyPipOpacityFromSettings();          // live panel → PiP window opacity
+        updateShortsRailState();                // shorts auto-toggle paint (stage 07)
       }
       if (changes.yt_sessions) {
         // Active-session switch re-filters the strip (contract ruling 2)
@@ -1637,7 +1874,12 @@
     injectInPageQueueStyles();
     refreshQueuedIds().then(applyThumbnailIndicators);
     // Settings first (ensureInPageQueue reads cachedSettings), then queue data
-    getSettings().then((s) => { ensureInPageQueue(); refreshInPageQueue(); syncAutoPip(s); });
+    getSettings().then((s) => {
+      ensureInPageQueue();
+      refreshInPageQueue();
+      syncAutoPip(s);
+      updateShortsFeatures(); // rail on /shorts/ (stage 07)
+    });
     startTracking();
     resetSeekHistory(getCurrentVideoId());
     bindVideoFeatures();
@@ -1675,6 +1917,11 @@
         resetSeekHistory(navVideoId);
         rateSyncArmedAt = 0;
       }
+      // Shorts (stage 07): loop detection is per-Short — reset on navigation
+      // and add/remove the rail according to the new path
+      prevShortTime = 0;
+      lastLoopFiredId = null;
+      updateShortsFeatures();
       // Re-attach the flexy attribute observer on the new page (the 3s
       // applyYouTubeUI below reaches applyPlayerSize, which re-creates it)
       if (resizeFlexyObserver) { resizeFlexyObserver.disconnect(); resizeFlexyObserver = null; }

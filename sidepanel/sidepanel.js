@@ -26,6 +26,10 @@ let openTabIds = new Set();
 // Never recomputed on plain renders.
 let suggestScores = { channels: {} };
 let lastScoreFetch = 0;
+// Shorts (stage 07): in-panel embed player + tools-strip toggle state
+let shortsPlayerVideoId = null;
+const embedCache = new Map(); // videoId -> embeddable boolean (per panel session)
+let panelSettings = {};       // mirror of yt_settings for the shorts toggles
 
 async function loadSuggestScores(force) {
   if (!force && Date.now() - lastScoreFetch < 60000) return;
@@ -175,6 +179,9 @@ async function loadSettings() {
     document.querySelectorAll('.pip-size-btn').forEach(b =>
       b.classList.toggle('active', b.dataset.size === (s.pipSize || 'medium')));
     applyPanelMode(s.panelMode || 'full');
+    // Shorts toggles (stage 07) repaint only from settings state
+    panelSettings = s || {};
+    syncShortsToggles();
 
     currentSort = s.sortBy || 'addedAt';
     if (currentSort === 'custom') currentSort = 'addedAt'; // 'suggested' passes through
@@ -478,6 +485,17 @@ function buildVideoItem(v, _unused, isWatched) {
     metaChildren.push(el('span', { text: 'Uploaded ' + fmtDate(v.uploadedAt) }));
   }
 
+  // Shorts cards get a 4th fixed-20px action button (watch in panel) — same
+  // row, so the 59px card height / CARD_HEIGHT 63 geometry is untouched
+  const bottomBtns = [starBtn, removeBtn, watchBtn];
+  if (v.isShort) {
+    const panelBtn = el('button', {
+      class: 'card-sm-btn card-panel-btn', text: '⧉', title: 'Watch in panel',
+    });
+    panelBtn.addEventListener('click', e => { e.stopPropagation(); openShortsPlayer(v.id); });
+    bottomBtns.push(panelBtn);
+  }
+
   const item = el('div', {
     class: 'video-item' + (isWatched ? ' watched' : ''),
     'data-id': v.id,
@@ -491,7 +509,7 @@ function buildVideoItem(v, _unused, isWatched) {
       el('div', { class: 'video-title', title: v.title || '', text: v.title || 'Unknown' }),
       el('div', { class: 'video-meta' }, metaChildren),
     ]),
-    el('div', { class: 'card-right' }, [playBtn, el('div', { class: 'card-bottom-actions' }, [starBtn, removeBtn, watchBtn])]),
+    el('div', { class: 'card-right' }, [playBtn, el('div', { class: 'card-bottom-actions' }, bottomBtns)]),
   ]);
 
   // Slim tiles hide .video-info — the tooltip is the only title surface
@@ -529,14 +547,18 @@ function buildNowPlayingCard(video, state) {
   const progressFill = el('div', { class: 'np-progress-fill', style: { width: pct + '%' } });
   const timeText = el('span', { class: 'np-time', text: dur(Math.floor(state.currentTime)) + ' / ' + dur(Math.floor(state.duration)) });
 
+  // Shorts variant (stage 07): ±5s seeks instead of ±10s, and "skip" becomes
+  // "next Short" (queue-skip semantics don't apply to the Shorts feed)
+  const seekSecs = state.isShorts ? 5 : 10;
+
   // Media buttons — commands carry the tabId of the tab being displayed so
   // the service worker controls THAT video, not whatever tab is active
   const mediaControl = action =>
-    msg({ type: 'MEDIA_CONTROL', action, tabId: lastMediaState?.tabId });
+    msg({ type: 'MEDIA_CONTROL', action, seconds: seekSecs, tabId: lastMediaState?.tabId });
 
-  // Build SVGs via innerHTML (safe — no user data)
+  // Build SVGs via innerHTML (safe — no user data; seekSecs is our constant)
   const rewindBtn = el('button', { class: 'np-btn' });
-  rewindBtn.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg><span class="np-btn-label">10</span>';
+  rewindBtn.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg><span class="np-btn-label">' + seekSecs + '</span>';
   rewindBtn.addEventListener('click', () => mediaControl('rewind'));
 
   const playPauseBtn = el('button', { class: 'np-btn np-btn--play' });
@@ -551,12 +573,20 @@ function buildNowPlayingCard(video, state) {
   });
 
   const forwardBtn = el('button', { class: 'np-btn' });
-  forwardBtn.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.13-9.36L23 10"/></svg><span class="np-btn-label">10</span>';
+  forwardBtn.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.13-9.36L23 10"/></svg><span class="np-btn-label">' + seekSecs + '</span>';
   forwardBtn.addEventListener('click', () => mediaControl('forward'));
 
-  const skipBtn = el('button', { class: 'np-btn np-btn--skip' });
+  const skipBtn = el('button', {
+    class: 'np-btn np-btn--skip',
+    title: state.isShorts ? 'Next Short' : 'Skip to next queued video',
+  });
   skipBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,4 15,12 5,20"/><rect x="17" y="5" width="3" height="14"/></svg>';
   skipBtn.addEventListener('click', async () => {
+    if (state.isShorts) {
+      // Advance the Shorts feed in the displayed tab instead of queue-skip
+      mediaControl('shortsNext');
+      return;
+    }
     await msg({
       type: 'SKIP_VIDEO',
       videoId: video.id,
@@ -640,6 +670,10 @@ async function updateNowPlaying() {
     // PiP row knobs only apply to the Document-PiP floating player — grey
     // them when the displayed tab affirmatively reports no support (stage 03)
     setPipRowDisabled(!!state.videoId && state.docPipSupported === false);
+
+    // Shorts tools strip follows the displayed tab (stage 07) — covers both
+    // the empty fallback (isShorts false ⇒ hidden) and real states
+    updateShortsToolsVisibility(state);
 
     if (!state.videoId) {
       if (nowPlayingVideoId) {
@@ -787,9 +821,10 @@ for (const [btnId, settingKey] of Object.entries(toggleMap)) {
   });
 }
 
-// Hover descriptions for ALL buttons with data-desc in toggle bar
+// Hover descriptions for ALL buttons with data-desc in the toggle bars and
+// the shorts tools strip (contract section 5)
 const descEl = document.getElementById('toggle-desc');
-document.querySelectorAll('.toggle-bar [data-desc]').forEach(btn => {
+document.querySelectorAll('.toggle-bar [data-desc], .shorts-tools [data-desc]').forEach(btn => {
   btn.addEventListener('mouseenter', () => { descEl.textContent = btn.dataset.desc; });
 });
 
@@ -818,6 +853,168 @@ document.getElementById('tb-export').addEventListener('click', async () => {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 10000); // let the download start safely
+});
+
+// --- Shorts Tools (stage 07) ---
+
+// Strip visibility follows GET_MEDIA_STATE.isShorts (the DISPLAYED tab —
+// same notion the now-playing card uses, so the two always agree)
+function updateShortsToolsVisibility(state) {
+  document.getElementById('shorts-tools').style.display = state?.isShorts ? '' : 'none';
+}
+
+function syncShortsToggles() {
+  document.getElementById('st-autoscroll').classList.toggle('active', !!panelSettings.shortsAutoScroll);
+  document.getElementById('st-autoclose').classList.toggle('active', !!panelSettings.shortsAutoClose);
+}
+
+document.getElementById('st-prev').addEventListener('click', () =>
+  msg({ type: 'MEDIA_CONTROL', action: 'shortsPrev', tabId: lastMediaState?.tabId }));
+document.getElementById('st-next').addEventListener('click', () =>
+  msg({ type: 'MEDIA_CONTROL', action: 'shortsNext', tabId: lastMediaState?.tabId }));
+document.getElementById('st-open-panel').addEventListener('click', () => {
+  if (lastMediaState?.videoId) openShortsPlayer(lastMediaState.videoId);
+});
+// Mutually exclusive auto-behaviors: turning one on writes the other off in
+// the same UPDATE_SETTINGS. No optimistic class flips — buttons repaint from
+// storage.onChanged only, so the panel and in-page rail can never disagree.
+document.getElementById('st-autoscroll').addEventListener('click', () => {
+  const on = !panelSettings.shortsAutoScroll;
+  msg({ type: 'UPDATE_SETTINGS', settings: { shortsAutoScroll: on, ...(on ? { shortsAutoClose: false } : {}) } });
+});
+document.getElementById('st-autoclose').addEventListener('click', () => {
+  const on = !panelSettings.shortsAutoClose;
+  msg({ type: 'UPDATE_SETTINGS', settings: { shortsAutoClose: on, ...(on ? { shortsAutoScroll: false } : {}) } });
+});
+
+// --- In-panel Shorts player (stage 07) ---
+
+// Panel-side embeddability pre-flight (plan decision 9): extension pages
+// have <all_urls> host permission, so this fetch is CORS-free. Stateless
+// read — fail-open on network error (the iframe shows YouTube's own error
+// UI at worst, with our Open-in-tab button still in the header).
+function checkEmbeddable(videoId) {
+  if (embedCache.has(videoId)) return Promise.resolve(embedCache.get(videoId));
+  return fetch('https://www.youtube.com/embed/' + videoId)
+    .then(r => r.ok ? r.text() : '')
+    .then(html => {
+      let ok = true;
+      if (/"status"\s*:\s*"UNPLAYABLE"/.test(html)) ok = false;
+      const m = html.match(/"playableInEmbed"\s*:\s*(true|false)/);
+      if (m) ok = m[1] === 'true';
+      embedCache.set(videoId, ok);
+      return ok;
+    })
+    .catch(() => true);
+}
+
+async function openShortsPlayer(videoId) {
+  shortsPlayerVideoId = videoId;
+  const container = document.getElementById('shorts-player');
+  const known = cachedVideos.find(v => v.id === videoId);
+  const title = known?.title || 'Short';
+
+  // Header: title + open-in-tab + close (el() only — never innerHTML with
+  // user data; the URL is built from the validated 11-char id)
+  const openTabBtn = el('button', { class: 'card-sm-btn', text: '↗', title: 'Open in tab' });
+  openTabBtn.addEventListener('click', () =>
+    msg({ type: 'OPEN_VIDEO', url: 'https://www.youtube.com/shorts/' + videoId }));
+  const closeBtn = el('button', { class: 'card-sm-btn', id: 'sp-close', text: '✕', title: 'Close player' });
+  closeBtn.addEventListener('click', closeShortsPlayer);
+
+  const frameWrap = el('div', { class: 'sp-frame-wrap' });
+
+  // Footer nav walks the panel's Shorts list in its current sort order
+  const idx = dataShorts.findIndex(v => v.id === videoId);
+  const prevBtn = el('button', { class: 'np-btn', id: 'sp-prev', title: 'Previous Short in the list' });
+  prevBtn.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18,15 12,9 6,15"/></svg>'; // static SVG
+  prevBtn.disabled = idx <= 0;
+  prevBtn.addEventListener('click', () => { if (idx > 0) openShortsPlayer(dataShorts[idx - 1].id); });
+  const nextBtn = el('button', { class: 'np-btn', id: 'sp-next', title: 'Next Short in the list' });
+  nextBtn.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6,9 12,15 18,9"/></svg>'; // static SVG
+  nextBtn.disabled = idx < 0 || idx >= dataShorts.length - 1;
+  nextBtn.addEventListener('click', () => {
+    if (idx >= 0 && idx < dataShorts.length - 1) openShortsPlayer(dataShorts[idx + 1].id);
+  });
+  const pos = el('span', {
+    class: 'sp-pos',
+    text: idx >= 0 ? (idx + 1) + ' / ' + dataShorts.length : '',
+  });
+
+  container.textContent = '';
+  container.appendChild(el('div', { class: 'sp-card' }, [
+    el('div', { class: 'sp-head' }, [
+      el('div', { class: 'sp-title', title: title, text: title }),
+      openTabBtn, closeBtn,
+    ]),
+    frameWrap,
+    el('div', { class: 'sp-nav' }, [prevBtn, pos, nextBtn]),
+  ]));
+  container.style.display = '';
+  // The player changes every list's offsetTop — cached ranges are stale
+  lastRenderKeys.clear();
+  renderVisibleCards();
+
+  // Avoid double audio: pause the displayed tab ONCE at open time
+  if (lastMediaState && lastMediaState.videoId && !lastMediaState.paused && lastMediaState.tabId) {
+    msg({ type: 'MEDIA_CONTROL', action: 'playPause', tabId: lastMediaState.tabId });
+  }
+
+  const ok = await checkEmbeddable(videoId);
+  if (shortsPlayerVideoId !== videoId) return; // closed/switched while fetching
+
+  if (ok) {
+    const iframe = el('iframe', {
+      src: 'https://www.youtube.com/embed/' + videoId
+        + '?autoplay=1&playsinline=1&rel=0&enablejsapi=1&origin='
+        + encodeURIComponent(location.origin),
+      allow: 'autoplay; encrypted-media; picture-in-picture',
+    });
+    // Raw jsapi handshake (the official IFrame API script can't load under
+    // the extension page CSP). Best-effort: ended-detection only.
+    iframe.addEventListener('load', () => {
+      try {
+        iframe.contentWindow.postMessage(
+          JSON.stringify({ event: 'listening', id: 'ytm' }), 'https://www.youtube.com');
+      } catch {}
+    });
+    frameWrap.appendChild(iframe);
+  } else {
+    const openBtn = el('button', { text: 'Open in tab' });
+    openBtn.addEventListener('click', () =>
+      msg({ type: 'OPEN_VIDEO', url: 'https://www.youtube.com/shorts/' + videoId }));
+    frameWrap.appendChild(el('div', { class: 'sp-error' }, [
+      el('div', { text: "This Short can't be embedded." }),
+      openBtn,
+    ]));
+  }
+}
+
+function closeShortsPlayer() {
+  shortsPlayerVideoId = null;
+  const container = document.getElementById('shorts-player');
+  container.textContent = '';
+  container.style.display = 'none';
+  lastRenderKeys.clear();
+  renderVisibleCards();
+}
+
+// Embed ended-bridge: YouTube's embed posts onStateChange info 0 on 'ended'
+// after the {event:'listening'} handshake. Mark watched + advance; if the
+// protocol ever breaks, the player still works manually (fail-soft).
+window.addEventListener('message', (e) => {
+  if (e.origin !== 'https://www.youtube.com' || !shortsPlayerVideoId) return;
+  let data;
+  try { data = JSON.parse(e.data); } catch { return; }
+  if (data.event === 'onStateChange' && data.info === 0) { // 0 = ended
+    const endedId = shortsPlayerVideoId;
+    if (cachedVideos.some(v => v.id === endedId && !v.watched)) {
+      msg({ type: 'UPDATE_VIDEO', videoId: endedId, sessionId: activeSessionId, updates: { watched: true } });
+    }
+    const idx = dataShorts.findIndex(v => v.id === endedId);
+    const next = idx >= 0 ? dataShorts[idx + 1] : null;
+    if (next) openShortsPlayer(next.id); else closeShortsPlayer();
+  }
 });
 
 // --- Drag and Drop ---
@@ -1162,6 +1359,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
     // on a real change — the local click already applied its mode pre-write
     const mode = s.panelMode === 'slim' ? 'slim' : 'full';
     if (mode !== panelMode) applyPanelMode(mode);
+    // Shorts auto-toggles (stage 07): repaint from storage state only — the
+    // strip and the in-page rail both write here and both repaint from here
+    panelSettings = s;
+    syncShortsToggles();
   }
   // Session list/pointer changes propagate via storage — no broadcast type;
   // multi-window panels converge on the same global active session for free

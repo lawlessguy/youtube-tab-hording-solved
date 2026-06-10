@@ -768,11 +768,13 @@ async function handleMessage(message, sender) {
     case MSG.GET_MEDIA_STATE: {
       // Every return includes tabId so the panel can route media commands
       // back to the tab it is actually displaying. Stage 03: content-script
-      // responses now also carry pipActive/docPipSupported — the queryTab
-      // spread passes them through untouched, and the empty fallback mirrors
-      // them with false defaults (contract section 3).
+      // responses now also carry pipActive/docPipSupported; stage 07 adds
+      // isShorts/url — the queryTab spread passes them through untouched, and
+      // the empty fallback mirrors every field with false/null defaults
+      // (contract section 3 final shape).
       const empty = {
         paused: true, currentTime: 0, duration: 0, videoId: null, tabId: null,
+        isShorts: false, url: null,
         pipActive: false, docPipSupported: false,
       };
 
@@ -1123,6 +1125,28 @@ async function handleMessage(message, sender) {
         }
       }
       return { autoPlayed: false };
+    }
+
+    case MSG.CLOSE_SHORT_TAB: {
+      // Explicit feature exception to "never close the active tab" (contract
+      // ruling 5): Shorts auto-close closes ONLY the sender's own tab, after
+      // re-validating the setting from storage and that the tab's CURRENT
+      // url is a hostname-validated Short. A message without sender.tab
+      // (panel/popup callers) is refused — this path can never close an
+      // arbitrary tab.
+      const tabId = sender.tab?.id;
+      if (!tabId) return { closed: false, reason: 'no-sender-tab' };
+      const settings = await storage.get(STORAGE_KEYS.SETTINGS);
+      if (!settings?.shortsAutoClose) return { closed: false, reason: 'disabled' };
+      let tab;
+      try { tab = await chrome.tabs.get(tabId); } catch { return { closed: false, reason: 'gone' }; }
+      if (!isShortUrl(tab.url)) return { closed: false, reason: 'not-short' };
+      try {
+        await chrome.tabs.remove(tabId);
+        return { closed: true };
+      } catch {
+        return { closed: false, reason: 'remove-failed' };
+      }
     }
 
     // --- Sessions (yt_sessions) ---
