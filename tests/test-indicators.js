@@ -8,6 +8,15 @@ const path = require('path');
 const extensionPath = path.resolve(__dirname, '..');
 const screenshotDir = path.join(extensionPath, 'screenshots');
 
+// Badge-eligible thumbnail anchors — keep in sync with content.js
+// applyThumbnailIndicators(). Seeding ids from anchors OUTSIDE this set
+// produces ids that never receive badges (the old generic
+// a[href*="/watch?v="] fallback did exactly that on current YouTube).
+const THUMB_ANCHOR_SELECTOR =
+  'a.ytLockupViewModelContentImage[href], ' +       // current lockup layout (2026, camelCase)
+  'a.yt-lockup-view-model__content-image[href], ' + // lockup layout (2024)
+  'a#thumbnail[href]';                              // legacy layout
+
 (async () => {
   console.log('Launching Chromium with extension...');
   const context = await chromium.launchPersistentContext('', {
@@ -25,6 +34,17 @@ const screenshotDir = path.join(extensionPath, 'screenshots');
   const extensionId = sw.url().split('/')[2];
   console.log('Extension ID:', extensionId);
 
+  // Wait for onInstalled to finish seeding storage on the fresh profile —
+  // writing yt_videos immediately races normalizeLegacyVideos (it initializes
+  // an absent yt_videos to [] and would clobber our seed)
+  await sw.evaluate(async () => {
+    for (let i = 0; i < 50; i++) {
+      const r = await chrome.storage.local.get(['yt_settings', 'yt_videos']);
+      if (r.yt_settings && r.yt_videos) return;
+      await new Promise(res => setTimeout(res, 100));
+    }
+  });
+
   // Step 1: Open a YouTube video to add to the queue
   console.log('\n--- Step 1: Open YouTube video ---');
   const ytPage = await context.newPage();
@@ -40,28 +60,16 @@ const screenshotDir = path.join(extensionPath, 'screenshots');
     }
   } catch {}
 
-  // Find the first video link — try multiple selectors for different YT layouts
-  let firstVideoId = await ytPage.evaluate(() => {
-    // New layout
-    let link = document.querySelector('a.yt-lockup-view-model__content-image[href*="/watch"]');
-    if (link) {
-      const m = link.getAttribute('href').match(/\/watch\?v=([a-zA-Z0-9_-]{11})/);
-      if (m) return m[1];
-    }
-    // Old layout
-    link = document.querySelector('a#thumbnail[href*="/watch"]');
-    if (link) {
-      const m = link.getAttribute('href').match(/\/watch\?v=([a-zA-Z0-9_-]{11})/);
-      if (m) return m[1];
-    }
-    // Any anchor with /watch
-    link = document.querySelector('a[href*="/watch?v="]');
-    if (link) {
-      const m = link.getAttribute('href').match(/\/watch\?v=([a-zA-Z0-9_-]{11})/);
+  // Find the first video link — ONLY from badge-eligible thumbnail anchors
+  // (current lockup layout first); seeding from generic anchors yields ids
+  // the indicator pass never decorates
+  let firstVideoId = await ytPage.evaluate((sel) => {
+    for (const link of document.querySelectorAll(sel)) {
+      const m = (link.getAttribute('href') || '').match(/\/watch\?v=([a-zA-Z0-9_-]{11})/);
       if (m) return m[1];
     }
     return null;
-  });
+  }, THUMB_ANCHOR_SELECTOR);
 
   // If still null, check what's on the page
   if (!firstVideoId) {
@@ -119,20 +127,16 @@ const screenshotDir = path.join(extensionPath, 'screenshots');
   await ytPage.goto('https://www.youtube.com/watch?v=' + firstVideoId, { waitUntil: 'domcontentloaded' });
   await ytPage.waitForTimeout(6000); // Wait for recommendations + content script cycle
 
-  // Add some recommended video IDs to the queue too
-  const recIds = await ytPage.evaluate(() => {
-    const anchors = document.querySelectorAll(
-      'a.yt-lockup-view-model__content-image[href*="/watch"], ' +
-      'a#thumbnail[href*="/watch"], ' +
-      'a[href*="/watch?v="]'
-    );
+  // Add some recommended video IDs to the queue too — again, only ids whose
+  // thumbnails the indicator pass actually decorates
+  const recIds = await ytPage.evaluate((sel) => {
     const ids = [];
-    for (const a of anchors) {
+    for (const a of document.querySelectorAll(sel)) {
       const m = (a.getAttribute('href') || '').match(/\/watch\?v=([a-zA-Z0-9_-]{11})/);
-      if (m && ids.length < 3) ids.push(m[1]);
+      if (m && !ids.includes(m[1]) && ids.length < 3) ids.push(m[1]);
     }
     return ids;
-  });
+  }, THUMB_ANCHOR_SELECTOR);
   console.log('Recommended video IDs found:', recIds.length, recIds.slice(0, 3));
 
   // Add the first rec as queued (unwatched), second as watched
@@ -177,18 +181,17 @@ const screenshotDir = path.join(extensionPath, 'screenshots');
   await ytPage.waitForTimeout(5000);
 
   // Step 4: Check what the content script found
-  const debugInfo = await ytPage.evaluate(() => {
+  const debugInfo = await ytPage.evaluate((sel) => {
     const badges = document.querySelectorAll('.ytm-status-badge');
     const style = document.getElementById('ytm-indicator-style');
 
-    // Check what thumbnail anchors exist
-    const lockupAnchors = document.querySelectorAll('a.yt-lockup-view-model__content-image');
+    // Check what thumbnail anchors exist (current camelCase lockup vs legacy)
+    const lockupAnchors = document.querySelectorAll(
+      'a.ytLockupViewModelContentImage, a.yt-lockup-view-model__content-image');
     const oldAnchors = document.querySelectorAll('a#thumbnail[href]');
 
-    // Check all anchors with watch/shorts hrefs that have images
-    const allThumbAnchors = document.querySelectorAll(
-      'a.yt-lockup-view-model__content-image, a#thumbnail[href]'
-    );
+    // All badge-eligible thumbnail anchors
+    const allThumbAnchors = document.querySelectorAll(sel);
 
     const anchorDetails = [...allThumbAnchors].slice(0, 5).map(a => {
       const href = a.getAttribute('href') || '';
@@ -208,7 +211,7 @@ const screenshotDir = path.join(extensionPath, 'screenshots');
       totalThumbAnchors: allThumbAnchors.length,
       anchorDetails,
     };
-  });
+  }, THUMB_ANCHOR_SELECTOR);
 
   console.log('Debug info:', JSON.stringify(debugInfo, null, 2));
 
@@ -225,10 +228,16 @@ const screenshotDir = path.join(extensionPath, 'screenshots');
   });
   console.log('Badge breakdown — Q (queued):', badgeDetails.queued, ', W (watched):', badgeDetails.watched);
 
-  if (debugInfo.badgeCount > 0) {
-    console.log('\n✔ SUCCESS: Found', debugInfo.badgeCount, 'badge(s) on thumbnails');
+  // A watched badge is only expected when a watched rec was actually seeded
+  const expectWatched = recIds.length > 1;
+  const ok = badgeDetails.queued > 0 && (!expectWatched || badgeDetails.watched > 0);
+
+  if (ok) {
+    console.log('\n✔ SUCCESS: Found', debugInfo.badgeCount, 'badge(s) on thumbnails (Q:',
+      badgeDetails.queued + ', W:', badgeDetails.watched + ')');
   } else {
-    console.log('\n✘ FAIL: No badges found');
+    console.log('\n✘ FAIL: Expected Q' + (expectWatched ? ' and W' : '') +
+      ' badges, got Q:', badgeDetails.queued, 'W:', badgeDetails.watched);
     console.log('  Style injected:', debugInfo.styleInjected);
     console.log('  Lockup anchors:', debugInfo.lockupAnchors);
     console.log('  Old-style anchors:', debugInfo.oldAnchors);
@@ -250,4 +259,5 @@ const screenshotDir = path.join(extensionPath, 'screenshots');
 
   await context.close();
   console.log('\nDone.');
+  process.exit(ok ? 0 : 1);
 })();
