@@ -25,15 +25,18 @@ let dragInProgress = false;
 let renderPendingAfterDrag = false;
 
 // --- Helpers ---
+// Round to whole minutes FIRST — rounding the remainder produced "1h 60m"
 function fmt(min) {
-  if (min < 60) return Math.round(min) + 'm';
-  const h = Math.floor(min / 60);
-  const m = Math.round(min % 60);
+  const total = Math.round(min);
+  if (total < 60) return total + 'm';
+  const h = Math.floor(total / 60);
+  const m = total % 60;
   return m > 0 ? h + 'h ' + m + 'm' : h + 'h';
 }
 
 function dur(sec) {
   if (!sec) return '--:--';
+  sec = Math.floor(sec);
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
   const s = sec % 60;
@@ -166,6 +169,7 @@ function getVisibleVideoOrder() {
 }
 
 function storeVisibleVideoOrder() {
+  // Literal key — plain script, can't import STORAGE_KEYS.NEXT_VIDEO_ORDER
   chrome.storage.local.set({ yt_next_video_order: getVisibleVideoOrder() });
 }
 

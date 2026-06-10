@@ -42,6 +42,8 @@ export function getThumbnailUrl(videoId, quality = 'mqdefault') {
   return `https://img.youtube.com/vi/${videoId}/${quality}.jpg`;
 }
 
+// Returns null on any failure — callers keep their placeholder values and a
+// later refresh (or the content script's VIDEO_METADATA report) can fill in
 export async function fetchVideoMetadata(videoId) {
   const url = `https://www.youtube.com/watch?v=${videoId}`;
   try {
@@ -55,11 +57,7 @@ export async function fetchVideoMetadata(videoId) {
       thumbnail: getThumbnailUrl(videoId),
     };
   } catch {
-    return {
-      title: 'Unknown Title',
-      channel: 'Unknown Channel',
-      thumbnail: getThumbnailUrl(videoId),
-    };
+    return null;
   }
 }
 
@@ -105,25 +103,4 @@ export async function fetchVideoDetails(videoId) {
   } catch {
     return { duration: 0, uploadDate: null };
   }
-}
-
-export function formatDuration(seconds) {
-  if (!seconds || seconds === 0) return '--:--';
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  if (h > 0) {
-    return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-  }
-  return `${m}:${String(s).padStart(2, '0')}`;
-}
-
-export function formatWatchTime(minutes) {
-  if (minutes < 60) return `${Math.round(minutes)}m`;
-  const h = Math.floor(minutes / 60);
-  const m = Math.round(minutes % 60);
-  if (h < 24) return m > 0 ? `${h}h ${m}m` : `${h}h`;
-  const d = Math.floor(h / 24);
-  const rh = h % 24;
-  return rh > 0 ? `${d}d ${rh}h` : `${d}d`;
 }

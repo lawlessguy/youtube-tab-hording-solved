@@ -1,4 +1,4 @@
-import { STORAGE_KEYS, DEFAULT_SETTINGS, DEFAULT_CATEGORIES, MSG } from '../utils/constants.js';
+import { STORAGE_KEYS, DEFAULT_SETTINGS, MSG } from '../utils/constants.js';
 import * as storage from '../utils/storage.js';
 import {
   extractVideoId, isYouTubeUrl, isShortUrl, isYouTubeHost,
@@ -77,14 +77,6 @@ async function whitelistExtensionTab(tabId, ttlMs) {
 chrome.runtime.onInstalled.addListener(async () => {
   const settings = await storage.get(STORAGE_KEYS.SETTINGS);
   if (!settings) await storage.set(STORAGE_KEYS.SETTINGS, DEFAULT_SETTINGS);
-
-  const categories = await storage.get(STORAGE_KEYS.CATEGORIES);
-  if (!categories) {
-    await storage.set(STORAGE_KEYS.CATEGORIES, DEFAULT_CATEGORIES);
-  } else if (categories.length > 0 && typeof categories[0] === 'string') {
-    // Migrate from string[] to {name, description}[]
-    await storage.set(STORAGE_KEYS.CATEGORIES, categories.map(c => ({ name: c, description: '' })));
-  }
 
   const videos = await storage.get(STORAGE_KEYS.VIDEOS);
   if (!videos) await storage.set(STORAGE_KEYS.VIDEOS, []);
@@ -177,6 +169,8 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 
 // --- Silent Background Logging ---
 
+const MAX_LOGGED_VIDEOS = 200;
+
 async function logVideoSilently(url, videoId, starred) {
   await storage.update(STORAGE_KEYS.LOGGED_VIDEOS, (logged = []) => {
     const existing = logged.find(v => v.id === videoId);
@@ -186,6 +180,11 @@ async function logVideoSilently(url, videoId, starred) {
       return logged;
     }
     logged.push({ id: videoId, url, isShort: isShortUrl(url), timestamp: Date.now(), starred: !!starred });
+    // The log only drains on Collect — cap it so it can't grow forever
+    if (logged.length > MAX_LOGGED_VIDEOS) {
+      logged.sort((a, b) => b.timestamp - a.timestamp);
+      logged.length = MAX_LOGGED_VIDEOS;
+    }
     return logged;
   });
 }
@@ -217,7 +216,6 @@ async function addVideoToQueue(url, videoId, explicitTimestamp, starred) {
       addedAt: explicitTimestamp || Date.now(),
       uploadedAt: null,
       isShort: isShortUrl(url),
-      category: 'Uncategorized',
       watched: false,
       starred: !!starred,
     };
@@ -230,8 +228,6 @@ async function addVideoToQueue(url, videoId, explicitTimestamp, starred) {
   if (inserted) {
     // Fetch title, channel, duration & upload date in background (non-blocking)
     enrichVideo(videoId);
-    // Auto-categorize if AI is configured and user has custom categories
-    autoCategorizeSingle(videoId);
   }
 
   return inserted;
@@ -385,80 +381,6 @@ function sortVideosList(videos, sortBy, direction) {
   });
 }
 
-// --- AI Categorization ---
-
-async function autoCategorizeSingle(videoId) {
-  try {
-    const settings = await storage.get(STORAGE_KEYS.SETTINGS);
-    if (!settings?.autoCategorize) return;
-    if (!settings?.geminiApiKey) return;
-
-    const categories = await storage.get(STORAGE_KEYS.CATEGORIES) || [];
-    if (categories.length <= 1) return; // Only "Uncategorized"
-
-    const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
-    const video = videos.find(v => v.id === videoId);
-    if (!video) return;
-
-    const category = await categorizeWithGemini(video, categories, settings.geminiApiKey);
-    if (category && category !== 'Uncategorized') {
-      const freshVideos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
-      const idx = freshVideos.findIndex(v => v.id === videoId);
-      if (idx !== -1) {
-        freshVideos[idx].category = category;
-        await storage.set(STORAGE_KEYS.VIDEOS, freshVideos);
-        broadcast({ type: MSG.VIDEOS_UPDATED });
-      }
-    }
-  } catch (e) {
-    console.error('Auto-categorize failed:', e);
-  }
-}
-
-async function categorizeWithGemini(video, categories, apiKey) {
-  // Categories are now {name, description} objects
-  const catNames = categories.map(c => c.name || c).filter(n => n !== 'Uncategorized');
-  const catList = categories
-    .filter(c => (c.name || c) !== 'Uncategorized')
-    .map(c => {
-      const name = c.name || c;
-      const desc = c.description;
-      return desc ? `- ${name}: ${desc}` : `- ${name}`;
-    })
-    .join('\n');
-
-  const prompt = `Categorize this YouTube video into one of these categories:
-${catList}
-
-Video title: "${video.title}"
-Channel: "${video.channel}"
-
-Make your best guess. Respond with ONLY the exact category name, nothing else.`;
-
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-      }),
-    }
-  );
-
-  if (!response.ok) throw new Error('Gemini API error: ' + response.status);
-
-  const data = await response.json();
-  const result = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-
-  if (result && catNames.includes(result)) return result;
-
-  // Fuzzy match (case-insensitive)
-  const lower = result?.toLowerCase();
-  const match = catNames.find(n => n.toLowerCase() === lower);
-  return match || 'Uncategorized';
-}
-
 // --- Broadcast ---
 
 function broadcast(message) {
@@ -546,15 +468,6 @@ async function handleMessage(message, sender) {
       return { added, tabIds: ytTabs.map(t => t.id) };
     }
 
-    case MSG.CLOSE_YT_TABS: {
-      const tabIds = message.tabIds || [];
-      // Preserve the currently active YouTube tab
-      const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      const toClose = activeTab ? tabIds.filter(id => id !== activeTab.id) : tabIds;
-      if (toClose.length > 0) await chrome.tabs.remove(toClose);
-      return { closed: toClose.length };
-    }
-
     case MSG.CLOSE_VISIBLE_TABS: {
       const videoIds = new Set(message.videoIds || []);
       const tabs = await chrome.tabs.query({});
@@ -576,7 +489,7 @@ async function handleMessage(message, sender) {
       return { removed: stats.duplicateTabIds.length };
     }
 
-    case 'CLOSE_SHORTS_TABS': {
+    case MSG.CLOSE_SHORTS_TABS: {
       const tabs = await chrome.tabs.query({});
       const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       const shortsTabs = tabs.filter(t =>
@@ -638,67 +551,14 @@ async function handleMessage(message, sender) {
       return { success: true };
     }
 
-    case MSG.CATEGORIZE_AI: {
-      const settings = await storage.get(STORAGE_KEYS.SETTINGS) || {};
-      if (!settings.geminiApiKey) return { error: 'No API key — add your Gemini key below' };
-
-      const categories = await storage.get(STORAGE_KEYS.CATEGORIES) || DEFAULT_CATEGORIES;
-      const customCats = categories.filter(c => (c.name || c) !== 'Uncategorized');
-      if (customCats.length === 0) return { error: 'Create categories first (use + button)' };
-
-      const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
-      const toCategorize = videos.filter(v => !v.watched);
-      if (toCategorize.length === 0) return { error: 'No videos to categorize' };
-
-      if (message.videoId) {
-        // Single video
-        const video = videos.find(v => v.id === message.videoId);
-        if (!video) return { error: 'Video not found' };
-        try {
-          const category = await categorizeWithGemini(video, categories, settings.geminiApiKey);
-          const idx = videos.findIndex(v => v.id === message.videoId);
-          if (idx !== -1) {
-            videos[idx].category = category;
-            await storage.set(STORAGE_KEYS.VIDEOS, videos);
-          }
-          return { category };
-        } catch (e) {
-          return { error: e.message };
-        }
-      } else {
-        // All unwatched videos
-        let categorized = 0;
-        let lastError = null;
-        for (const video of toCategorize) {
-          try {
-            const category = await categorizeWithGemini(video, categories, settings.geminiApiKey);
-            const idx = videos.findIndex(v => v.id === video.id);
-            if (idx !== -1 && category) {
-              videos[idx].category = category;
-              categorized++;
-            }
-          } catch (e) {
-            lastError = e.message;
-            console.error('AI categorize failed for', video.id, e);
-          }
-        }
-        await storage.set(STORAGE_KEYS.VIDEOS, videos);
-        broadcast({ type: MSG.VIDEOS_UPDATED });
-        if (categorized === 0 && lastError) {
-          return { error: lastError, categorized: 0 };
-        }
-        return { categorized };
-      }
-    }
-
-    case 'GET_MEDIA_STATE': {
+    case MSG.GET_MEDIA_STATE: {
       // Every return includes tabId so the panel can route media commands
       // back to the tab it is actually displaying
       const empty = { paused: true, currentTime: 0, duration: 0, videoId: null, tabId: null };
 
       async function queryTab(tabId) {
         try {
-          const state = await chrome.tabs.sendMessage(tabId, { type: 'GET_MEDIA_STATE' });
+          const state = await chrome.tabs.sendMessage(tabId, { type: MSG.GET_MEDIA_STATE });
           return state && state.videoId ? { ...state, tabId } : null;
         } catch { return null; }
       }
@@ -755,7 +615,7 @@ async function handleMessage(message, sender) {
       return empty;
     }
 
-    case 'REFRESH_METADATA': {
+    case MSG.REFRESH_METADATA: {
       // Re-fetch ALL video details, overwriting any drag-modified values.
       // Fetch outside the storage lock, then apply to a fresh snapshot in one
       // atomic update — a long refresh must not revert removes/mark-watched
@@ -838,21 +698,6 @@ async function handleMessage(message, sender) {
         await logVideoSilently(message.url, vid, true);
       }
       return { success: true };
-    }
-
-    case MSG.GET_QUEUED_IDS: {
-      const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
-      const queued = videos.filter(v => !v.watched).map(v => v.id);
-      const watched = videos.filter(v => v.watched).map(v => v.id);
-      return { ids: queued, watched };
-    }
-
-    case MSG.RESET_CATEGORIES: {
-      const videos = await storage.get(STORAGE_KEYS.VIDEOS) || [];
-      videos.forEach(v => { v.category = 'Uncategorized'; });
-      await storage.set(STORAGE_KEYS.VIDEOS, videos);
-      broadcast({ type: MSG.VIDEOS_UPDATED });
-      return { success: true, reset: videos.length };
     }
 
     case MSG.MEDIA_CONTROL: {
@@ -962,7 +807,7 @@ async function handleMessage(message, sender) {
 
       // Use the stored next-video order from the side panel if available
       let nextVideo = null;
-      const storedOrder = await storage.get('yt_next_video_order');
+      const storedOrder = await storage.get(STORAGE_KEYS.NEXT_VIDEO_ORDER);
       if (storedOrder && Array.isArray(storedOrder)) {
         for (const nid of storedOrder) {
           const v = videos.find(vv => vv.id === nid && !vv.watched);
@@ -986,12 +831,6 @@ async function handleMessage(message, sender) {
         }
       }
       return { autoPlayed: false };
-    }
-
-    case MSG.OPEN_TAB: {
-      const tab = await chrome.tabs.create({ url: message.url });
-      await whitelistExtensionTab(tab.id, 30000);
-      return { tabId: tab.id };
     }
 
     case MSG.OPEN_SIDE_PANEL: {
