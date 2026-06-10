@@ -94,7 +94,13 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 function updateSidePanelForTab(tabId, url) {
   const isYouTube = isYouTubeHost(url);
-  chrome.sidePanel.setOptions({ tabId, enabled: isYouTube }).catch(() => {});
+  // Tab-scoped options do NOT inherit the manifest default path — open()
+  // treats a path-less entry as "No active side panel for tabId" even when
+  // enabled, so path must always accompany enabled: true
+  const options = isYouTube
+    ? { tabId, enabled: true, path: 'sidepanel/sidepanel.html' }
+    : { tabId, enabled: false };
+  chrome.sidePanel.setOptions(options).catch(() => {});
 }
 
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
@@ -835,11 +841,15 @@ async function handleMessage(message, sender) {
 
     case MSG.OPEN_SIDE_PANEL: {
       if (message.tabId) {
-        // Re-enable in case this tab was disabled as non-YouTube. MUST be
-        // fire-and-forget: this handler runs synchronously off the message
-        // event and open() needs the caller's user gesture — any await
-        // before it consumes the gesture and open() throws.
-        chrome.sidePanel.setOptions({ tabId: message.tabId, enabled: true }).catch(() => {});
+        // Re-enable (with path — see updateSidePanelForTab) in case this tab
+        // was disabled as non-YouTube. MUST be fire-and-forget: this handler
+        // runs synchronously off the message event and open() needs the
+        // caller's user gesture — any await before it consumes the gesture.
+        chrome.sidePanel.setOptions({
+          tabId: message.tabId,
+          enabled: true,
+          path: 'sidepanel/sidepanel.html',
+        }).catch(() => {});
         await chrome.sidePanel.open({ tabId: message.tabId });
       }
       return { success: true };

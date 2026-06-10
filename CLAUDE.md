@@ -19,6 +19,8 @@ Chrome Manifest V3 extension — "YouTube Tab Manager". Manages YouTube video qu
   - `test-tab-management.js` — duplicate removal, panel enablement, intercept guards (live tabs)
   - `test-url-validation.js` — hostile lookalike URLs stay out of queue/stats
   - `test-event-driven.js` — storage.onChanged badge/watch-time propagation (routed fake YouTube page)
+  - `test-panel-gesture.js` — side panel opens from a trusted click with zero worker errors
+  - `test-panel-live.js` — manual headed E2E: real YouTube tab, real side panel, pixel-level visibility check, desktop screenshot to `screenshots/live-panel.png`
   - `test-indicators.js` — manual headed test for thumbnail badges on real YouTube
 
 ## Architecture
@@ -68,7 +70,8 @@ New YouTube tabs are caught via `chrome.tabs.onCreated` + `chrome.tabs.onUpdated
 
 ## Key Gotchas
 
-- `chrome.sidePanel.open()` requires user gesture context — call from popup click handlers or service worker `action.onClicked`
+- `chrome.sidePanel.open()` requires user gesture context, and the gesture does NOT survive an awaited extension-API call placed before it in the handler — the popup pre-enables the panel at popup-open time so the click handler can call `open()` with at most the `tabs.query` await
+- Tab-scoped `sidePanel.setOptions` entries do NOT inherit the manifest default path: `{ tabId, enabled: true }` without `path` makes `open()` throw "No active side panel for tabId". Always pass `path: 'sidepanel/sidepanel.html'` when enabling per-tab
 - Hidden checkboxes (custom toggle styling) need `{ force: true }` or `evaluate(() => el.click())` in Playwright tests
 - The volume-boost `AudioContext` reroutes ALL audio through itself via `createMediaElementSource` — if it is suspended (created without user activation) the video is silent at any volume. `resumeAudioContext()` is called on every volume change and from the tracking tick; keep that invariant when touching the boost path
 - URL checks must validate hostnames via `isYouTubeHost()` (utils/youtube.js) — substring checks like `url.includes('youtube.com')` match hostile lookalike URLs

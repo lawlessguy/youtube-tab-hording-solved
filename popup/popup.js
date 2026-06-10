@@ -67,16 +67,31 @@ document.getElementById('close-shorts').addEventListener('click', async () => {
 });
 
 // --- Open Side Panel ---
-document.getElementById('open-sidepanel').addEventListener('click', async () => {
+// Pre-enable the panel for the active tab the moment the popup opens. The
+// click handler must call open() with the user gesture intact: awaiting
+// setOptions inside the handler consumes the gesture ("may only be called in
+// response to a user gesture"), while firing it un-awaited races open()'s
+// validation ("No active side panel for tabId"). Enabling up-front, long
+// before the click, avoids both.
+(async () => {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab) {
-      // The worker disables the panel on non-YouTube tabs; re-enable before
-      // opening. MUST be fire-and-forget: awaiting it consumes the user
-      // gesture and open() then throws. The calls are processed in order.
-      chrome.sidePanel.setOptions({ tabId: tab.id, enabled: true }).catch(() => {});
-      await chrome.sidePanel.open({ tabId: tab.id });
+      // path is required: a tab-scoped entry without it makes open() throw
+      // "No active side panel for tabId" even when enabled
+      await chrome.sidePanel.setOptions({
+        tabId: tab.id,
+        enabled: true,
+        path: 'sidepanel/sidepanel.html',
+      });
     }
+  } catch {}
+})();
+
+document.getElementById('open-sidepanel').addEventListener('click', async () => {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab) await chrome.sidePanel.open({ tabId: tab.id });
   } catch {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     await msg({ type: 'OPEN_SIDE_PANEL', tabId: tab?.id });

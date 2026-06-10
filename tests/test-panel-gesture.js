@@ -8,6 +8,7 @@ const { chromium } = require('playwright');
 const path = require('path');
 
 const extensionPath = path.resolve(__dirname, '..');
+const headed = process.argv.includes('--headed');
 
 let passed = 0;
 let failed = 0;
@@ -25,6 +26,7 @@ function check(label, condition, detail) {
 (async () => {
   const context = await chromium.launchPersistentContext('', {
     channel: 'chromium',
+    headless: !headed,
     args: [
       `--disable-extensions-except=${extensionPath}`,
       `--load-extension=${extensionPath}`,
@@ -56,11 +58,23 @@ function check(label, condition, detail) {
   try { await popup.click('#open-sidepanel', { noWaitAfter: true }); } catch {}
   await new Promise(r => setTimeout(r, 2000));
 
+  // ANY worker error counts — the first regression threw "user gesture",
+  // the second "No active side panel for tabId"
   const swErrors = await sw.evaluate(() => self.__errors);
-  const gestureErrors = swErrors.filter(e => e.includes('user gesture'));
-  check('No user-gesture error in service worker', gestureErrors.length === 0,
+  check('No errors at all in service worker', swErrors.length === 0,
     JSON.stringify(swErrors));
   check('No page errors in popup', pageErrors.length === 0, JSON.stringify(pageErrors));
+
+  // Authoritative check: the panel document exists as a SIDE_PANEL context.
+  // (Playwright does not expose side panel targets as pages.)
+  let panelContexts = [];
+  for (let i = 0; i < 10 && panelContexts.length === 0; i++) {
+    panelContexts = await sw.evaluate(() =>
+      chrome.runtime.getContexts({ contextTypes: ['SIDE_PANEL'] }));
+    if (panelContexts.length === 0) await new Promise(r => setTimeout(r, 500));
+  }
+  check('Side panel actually opened (SIDE_PANEL context exists)',
+    panelContexts.length > 0, JSON.stringify(panelContexts));
 
   await context.close();
 
