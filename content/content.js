@@ -58,6 +58,17 @@
   }
 
   function getVideoElement() {
+    // While the player is floated in a Document PiP window the <video> lives
+    // in that window's document — searching it first keeps volume/speed/
+    // media-commands/watch-tracking working on the floated video (contract
+    // ruling 6). docPipWindow is declared in the PiP section below; this
+    // function is only ever called asynchronously, after the IIFE body ran.
+    if (docPipWindow) {
+      try {
+        const v = docPipWindow.document.querySelector('video');
+        if (v) return v;
+      } catch {}
+    }
     return document.querySelector('video');
   }
 
@@ -88,6 +99,11 @@
   function setVolume(percent) {
     const video = getVideoElement();
     if (!video) return;
+    // While floated in Document PiP, never engage the GainNode boost: a
+    // MediaElementAudioSourceNode belongs to the opener document's
+    // AudioContext, and initializing it against a cross-document element
+    // risks muting audio entirely (contract ruling 7) — clamp to 100%
+    if (docPipWindow && percent > 100) percent = 100;
     if (percent > 100) {
       initAudioBoost(video);
       video.volume = 1;
@@ -350,6 +366,9 @@
     bindRateSync(video);
     bindSeekHistory(video);
     applyStoredSettings();
+    // Re-assert the auto-PiP handler after SPA navigation — YouTube's own
+    // main-world registration is last-write-wins between worlds (stage 03)
+    if (cachedSettings) syncAutoPip(cachedSettings);
   }
 
   function flushWatchTime() {
@@ -474,11 +493,29 @@
           currentTime: video ? video.currentTime : 0,
           duration: video && isFinite(video.duration) ? video.duration : 0,
           videoId: getCurrentVideoId(),
+          // Stage 03: classic PiP element OR our Document PiP window open;
+          // the panel greys its pip-row knobs when docPipSupported is false
+          pipActive: !!docPipWindow || !!document.pictureInPictureElement,
+          docPipSupported: typeof window.documentPictureInPicture !== 'undefined',
         });
         break;
 
-      case 'MEDIA_COMMAND':
+      case 'MEDIA_COMMAND': {
+        // exitPip is no-op-safe and must not require a <video> (contract):
+        // close our Document PiP if open, else any classic PiP element
+        if (message.action === 'exitPip') {
+          if (docPipWindow) closeDocPip();
+          else if (document.pictureInPictureElement) {
+            document.exitPictureInPicture().catch(() => {});
+          }
+          sendResponse({ success: true });
+          break;
+        }
         if (!video) { sendResponse({ success: false }); break; }
+        // Optional seconds override for forward/rewind (contract, default 10)
+        const secs = typeof message.seconds === 'number' && isFinite(message.seconds) &&
+          message.seconds > 0 ? message.seconds : 10;
+        let handled = true;
         switch (message.action) {
           case 'playPause':
             video.paused ? video.play() : video.pause();
@@ -488,20 +525,283 @@
             video.play();
             break;
           case 'forward':
-            video.currentTime = Math.min(video.currentTime + 10, video.duration || Infinity);
+            video.currentTime = Math.min(video.currentTime + secs, video.duration || Infinity);
             break;
           case 'rewind':
-            video.currentTime = Math.max(video.currentTime - 10, 0);
+            video.currentTime = Math.max(video.currentTime - secs, 0);
             break;
+          default:
+            handled = false; // unknown actions respond {success:false} — never throw
         }
-        sendResponse({ success: true, paused: video.paused });
+        sendResponse(handled ? { success: true, paused: video.paused } : { success: false });
         break;
+      }
 
       default:
         sendResponse({});
     }
     return true;
   });
+
+  // --- Picture in Picture (stage 03) ---
+  // Float: moves the whole #movie_player container (never the bare <video> —
+  // YouTube's controls/layout live on the container) into a Document PiP
+  // window with a hover control strip (opacity dimming, S/M/L presets,
+  // restore), and re-inserts it intact on EVERY close path via 'pagehide'.
+  // Auto-PiP: a MediaSession 'enterpictureinpicture' handler (Chrome 134+
+  // invokes it gesture-free on tab switch when Chrome's own MEI/permission
+  // gates pass) opens CLASSIC video PiP — automatic DOM surgery on YouTube
+  // is too invasive for a background trigger.
+
+  let docPipWindow = null;          // Document PiP Window object, or null
+  let pipMovedPlayer = null;        // the #movie_player element while floated
+  let pipOriginalParent = null;     // restore anchor (same pattern as comments-move)
+  let pipOriginalNextSibling = null;
+  let pipPlaceholder = null;
+  let pipOpacityDebounce = null;
+  const PIP_SIZES = { small: [320, 180], medium: [480, 270], large: [640, 360] };
+
+  function getPlayerContainer() {
+    // null on shorts/non-watch pages — openDocPip then falls back to classic
+    return document.getElementById('movie_player');
+  }
+
+  function clampPipOpacity(v) {
+    const n = Number(v);
+    if (!isFinite(n)) return 100;
+    return Math.min(100, Math.max(30, Math.round(n)));
+  }
+
+  function openClassicPip() {
+    const v = getVideoElement();
+    if (!v || typeof v.requestPictureInPicture !== 'function') return;
+    try { v.requestPictureInPicture().catch(() => {}); } catch {}
+  }
+
+  function injectPipPageStyle() {
+    if (document.getElementById('ytm-pip-page-style')) return;
+    const style = document.createElement('style');
+    style.id = 'ytm-pip-page-style';
+    // Placeholder-only selectors — must never touch player sizing (contract
+    // ruling 8: later styles may not override the resize rules)
+    style.textContent = `
+      .ytm-pip-placeholder {
+        width: 100%; aspect-ratio: 16 / 9;
+        display: flex; align-items: center; justify-content: center;
+        background: #0f0f0f; color: #aaa;
+        font: 500 14px Roboto, Arial, sans-serif;
+        border: 1px solid #2a2a2a; border-radius: 12px;
+        cursor: pointer; text-align: center;
+      }
+      .ytm-pip-placeholder:hover { color: #fff; border-color: #555; }
+    `;
+    document.head.appendChild(style);
+  }
+
+  async function openDocPip(opts = {}) {
+    // Bail-outs (classic PiP still gives a floating video):
+    //  - Document PiP unsupported (Chrome < 116 / isolated-world gap)
+    //  - volume boost ever engaged: a cross-document MediaElementSource can
+    //    mute audio outright (contract ruling 7)
+    //  - shorts pages (different player DOM — high breakage, low value)
+    //  - no #movie_player container to move
+    if (!window.documentPictureInPicture || audioContext !== null ||
+        window.location.pathname.startsWith('/shorts') || !getPlayerContainer()) {
+      openClassicPip();
+      return;
+    }
+    // Fire-and-forget — the transient activation must not be spent waiting
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    const sizeKey = PIP_SIZES[opts.size] ? opts.size : 'medium';
+    const [w, h] = PIP_SIZES[sizeKey];
+    let win;
+    try {
+      win = await window.documentPictureInPicture.requestWindow({ width: w, height: h });
+    } catch (e) {
+      console.warn('[YT Tab Manager] PiP open failed:', e);
+      return;
+    }
+    const player = getPlayerContainer();
+    if (!player) { try { win.close(); } catch {} return; }
+    docPipWindow = win;
+    pipMovedPlayer = player;
+    pipOriginalParent = player.parentElement;
+    pipOriginalNextSibling = player.nextSibling;
+
+    const pdoc = win.document;
+    const styleEl = pdoc.createElement('style');
+    // Static CSS string — no user data near it
+    styleEl.textContent = `
+      body { margin:0; background:#0f0f0f; overflow:hidden;
+             font-family:'Segoe UI',system-ui,sans-serif; }
+      .ytm-pip-wrap { position:fixed; inset:0; opacity:var(--ytm-pip-op,1);
+                      transition:opacity .2s; }
+      .ytm-pip-wrap:hover { opacity:1 !important; }
+      #movie_player { width:100% !important; height:100% !important; }
+      #movie_player video { width:100% !important; height:100% !important; }
+      .ytm-pip-strip { position:fixed; left:0; right:0; bottom:0; display:flex;
+                       align-items:center; gap:8px; padding:6px 10px;
+                       background:rgba(15,15,15,.92); opacity:0;
+                       transition:opacity .2s; z-index:9999; }
+      body:hover .ytm-pip-strip { opacity:1; }
+      .ytm-pip-strip input[type=range] { flex:1; }
+      .ytm-pip-strip button { background:#1a1a1a; border:1px solid #2a2a2a;
+                              color:#aaa; border-radius:4px; padding:2px 8px;
+                              font-size:11px; cursor:pointer; }
+      .ytm-pip-strip button:hover { color:#f1f1f1; border-color:#555; }
+    `;
+    pdoc.head.appendChild(styleEl);
+
+    const wrap = pdoc.createElement('div');
+    wrap.className = 'ytm-pip-wrap';
+    wrap.appendChild(player); // adopts #movie_player into the PiP document
+    pdoc.body.appendChild(wrap);
+    const opacity = clampPipOpacity(opts.opacity);
+    pdoc.documentElement.style.setProperty('--ytm-pip-op', String(opacity / 100));
+
+    // Hover control strip — createElement/textContent only, no innerHTML.
+    // resizeTo() needs a transient activation INSIDE the PiP window, which
+    // these button clicks provide (the panel's presets only set open size).
+    const strip = pdoc.createElement('div');
+    strip.className = 'ytm-pip-strip';
+    const range = pdoc.createElement('input');
+    range.type = 'range';
+    range.min = '30';
+    range.max = '100';
+    range.step = '5';
+    range.value = String(opacity);
+    range.title = 'Opacity';
+    range.addEventListener('input', () => {
+      pdoc.documentElement.style.setProperty('--ytm-pip-op', String(Number(range.value) / 100));
+      if (pipOpacityDebounce) clearTimeout(pipOpacityDebounce);
+      pipOpacityDebounce = setTimeout(() => {
+        pipOpacityDebounce = null;
+        safeSend({ type: 'UPDATE_SETTINGS', settings: { pipOpacity: Number(range.value) } });
+      }, 300);
+    });
+    strip.appendChild(range);
+    for (const key of ['small', 'medium', 'large']) {
+      const b = pdoc.createElement('button');
+      b.textContent = key[0].toUpperCase();
+      b.title = 'Resize to ' + PIP_SIZES[key][0] + '×' + PIP_SIZES[key][1];
+      b.addEventListener('click', () => {
+        if (!docPipWindow) return;
+        try { docPipWindow.resizeTo(PIP_SIZES[key][0], PIP_SIZES[key][1]); } catch {}
+        safeSend({ type: 'UPDATE_SETTINGS', settings: { pipSize: key } });
+      });
+      strip.appendChild(b);
+    }
+    const back = pdoc.createElement('button');
+    back.textContent = '↩';
+    back.title = 'Back to tab';
+    back.addEventListener('click', closeDocPip);
+    strip.appendChild(back);
+    pdoc.body.appendChild(strip);
+
+    // Placeholder card at the player's old spot (click restores)
+    injectPipPageStyle();
+    pipPlaceholder = document.createElement('div');
+    pipPlaceholder.className = 'ytm-pip-placeholder';
+    pipPlaceholder.textContent = 'Playing in floating window — click to restore';
+    pipPlaceholder.addEventListener('click', closeDocPip);
+    try {
+      if (pipOriginalParent) pipOriginalParent.insertBefore(pipPlaceholder, pipOriginalNextSibling);
+    } catch {}
+
+    // 'pagehide' fires on EVERY close path (native ✕, strip restore button,
+    // placeholder click, a second Doc-PiP opened elsewhere, opener unload) —
+    // single restore entry point
+    win.addEventListener('pagehide', restorePipPlayer);
+    win.addEventListener('resize', () => {
+      try { window.dispatchEvent(new Event('resize')); } catch {}
+    });
+    window.dispatchEvent(new Event('resize')); // YouTube re-measures
+  }
+
+  // Runs on the PiP window's pagehide — possibly while the opener document
+  // is itself unloading, hence the blanket try/catch (restoring into a dying
+  // document is harmless)
+  function restorePipPlayer() {
+    try {
+      if (pipPlaceholder) { try { pipPlaceholder.remove(); } catch {} }
+      const player = pipMovedPlayer;
+      if (player) {
+        let parent = pipOriginalParent;
+        // YouTube re-rendered the parent while floated: degraded fallback —
+        // the player must never be lost (plan edge 18)
+        if (!parent || !parent.isConnected) {
+          parent = document.querySelector('#player-container') || document.body;
+        }
+        try {
+          if (pipOriginalNextSibling && pipOriginalNextSibling.parentNode === parent) {
+            parent.insertBefore(player, pipOriginalNextSibling);
+          } else {
+            parent.appendChild(player);
+          }
+        } catch { try { document.body.appendChild(player); } catch {} }
+      }
+    } catch {}
+    docPipWindow = null;
+    pipMovedPlayer = null;
+    pipOriginalParent = null;
+    pipOriginalNextSibling = null;
+    pipPlaceholder = null;
+    try { window.dispatchEvent(new Event('resize')); } catch {}
+  }
+
+  function closeDocPip() {
+    // close() needs no gesture; pagehide → restorePipPlayer does the rest
+    if (docPipWindow) { try { docPipWindow.close(); } catch {} }
+  }
+
+  function togglePip(opts = {}) {
+    if (docPipWindow) { closeDocPip(); return; }
+    if (document.pictureInPictureElement) {
+      document.exitPictureInPicture().catch(() => {});
+      return;
+    }
+    openDocPip(opts);
+  }
+  // Exposed on the shared isolated-world global: the side panel's float
+  // button injects a one-liner via chrome.scripting.executeScript (the
+  // click's user activation propagates into the injected function, which
+  // must therefore call this synchronously).
+  window.__ytmTogglePip = togglePip;
+
+  // Live panel → PiP-window opacity sync (storage.onChanged). Also mirrors
+  // the strip's own slider unless the user is holding it.
+  function applyPipOpacityFromSettings() {
+    if (!docPipWindow || typeof cachedSettings?.pipOpacity !== 'number') return;
+    try {
+      const op = clampPipOpacity(cachedSettings.pipOpacity);
+      const pdoc = docPipWindow.document;
+      pdoc.documentElement.style.setProperty('--ytm-pip-op', String(op / 100));
+      const range = pdoc.querySelector('.ytm-pip-strip input[type=range]');
+      if (range && pdoc.activeElement !== range) range.value = String(op);
+    } catch {}
+  }
+
+  // Auto-PiP on tab switch: Chrome invokes the registered handler WITHOUT a
+  // gesture when the user switches away from an eligible playing tab (Media
+  // Engagement Index + per-site permission gated — Chrome decides, we can't
+  // force it). Re-asserted on SPA navigation: YouTube's own main-world
+  // registration is last-write-wins between worlds (best effort).
+  function syncAutoPip(settings) {
+    try {
+      if (settings?.pipAutoEnabled) {
+        navigator.mediaSession.setActionHandler('enterpictureinpicture', async () => {
+          try {
+            const video = getVideoElement();
+            if (video && !document.pictureInPictureElement) {
+              await video.requestPictureInPicture(); // gesture-free here by spec
+            }
+          } catch {}
+        });
+      } else {
+        navigator.mediaSession.setActionHandler('enterpictureinpicture', null);
+      }
+    } catch {} // TypeError on Chrome < 134 (unknown action) — degrade silently
+  }
 
   // --- YouTube UI Modifications ---
 
@@ -909,7 +1209,9 @@
   }
 
   function startResizeDrag(e, handleEl, kind, mode, container) {
-    if (e.button !== 0 || resizeDrag) return;
+    // While the player is floated in Document PiP the container only holds a
+    // placeholder — resize handles no-op (contract ruling 6)
+    if (e.button !== 0 || resizeDrag || docPipWindow) return;
     e.preventDefault();
     const rect = container.getBoundingClientRect();
     const stored = (mode === 'theater'
@@ -1317,6 +1619,8 @@
         applyYouTubeUI();
         ensureInPageQueue();                    // strip toggled on/off
         renderInPageQueueFrom(lastKnownVideos); // sort changes re-order tiles
+        syncAutoPip(cachedSettings);            // auto-PiP toggle (stage 03)
+        applyPipOpacityFromSettings();          // live panel → PiP window opacity
       }
       if (changes.yt_sessions) {
         // Active-session switch re-filters the strip (contract ruling 2)
@@ -1333,7 +1637,7 @@
     injectInPageQueueStyles();
     refreshQueuedIds().then(applyThumbnailIndicators);
     // Settings first (ensureInPageQueue reads cachedSettings), then queue data
-    getSettings().then(() => { ensureInPageQueue(); refreshInPageQueue(); });
+    getSettings().then((s) => { ensureInPageQueue(); refreshInPageQueue(); syncAutoPip(s); });
     startTracking();
     resetSeekHistory(getCurrentVideoId());
     bindVideoFeatures();
@@ -1346,6 +1650,9 @@
   const observer = new MutationObserver(() => {
     if (window.location.href !== lastUrl) {
       lastUrl = window.location.href;
+      // Floated player: SPA navigation closes the Document PiP first — its
+      // pagehide restores #movie_player before YouTube re-renders (stage 03)
+      closeDocPip();
       flushWatchTime();
       accumulatedSeconds = 0;
       hasMarkedWatched = false;

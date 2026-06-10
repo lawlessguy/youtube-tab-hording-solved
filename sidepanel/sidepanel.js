@@ -167,6 +167,13 @@ async function loadSettings() {
     // are absent): undefined reads as the default true
     document.getElementById('tb-resize').classList.toggle('active', s.playerResizeEnabled !== false);
     document.getElementById('tb-inpage').classList.toggle('active', !!s.inPageQueue);
+    // PiP controls (stage 03)
+    document.getElementById('tb-autopip').classList.toggle('active', !!s.pipAutoEnabled);
+    const pipOp = Math.min(100, Math.max(30, s.pipOpacity ?? 100));
+    document.getElementById('pip-opacity-slider').value = pipOp;
+    document.getElementById('pip-opacity-value').textContent = pipOp + '%';
+    document.querySelectorAll('.pip-size-btn').forEach(b =>
+      b.classList.toggle('active', b.dataset.size === (s.pipSize || 'medium')));
     applyPanelMode(s.panelMode || 'full');
 
     currentSort = s.sortBy || 'addedAt';
@@ -559,6 +566,35 @@ function buildNowPlayingCard(video, state) {
     loadVideos();
   });
 
+  // Float button (stage 03): toggles the Document-PiP floating player for
+  // the DISPLAYED tab (same routing invariant as the media buttons)
+  const pipBtn = el('button', {
+    class: 'np-btn np-btn--pip' + (state.pipActive ? ' active' : ''),
+    id: 'np-pip-btn',
+    title: 'Float video (picture-in-picture)',
+  });
+  pipBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="14" rx="2"/><rect x="11" y="11" width="8" height="5" rx="1" fill="currentColor" stroke="none"/></svg>'; // static SVG — allowed
+  pipBtn.addEventListener('click', () => {
+    const tabId = lastMediaState?.tabId;
+    if (!tabId) return;
+    if (lastMediaState?.pipActive) {
+      // Closing needs no gesture — route through the normal command path
+      msg({ type: 'MEDIA_CONTROL', action: 'exitPip', tabId });
+      return;
+    }
+    // SYNCHRONOUS injection — no awaits before it: the click's user
+    // activation must propagate into the injected function (same rule as
+    // the sidePanel.open() gotcha). args are computed synchronously too.
+    chrome.scripting.executeScript({
+      target: { tabId },
+      func: (opts) => { if (window.__ytmTogglePip) window.__ytmTogglePip(opts); },
+      args: [{
+        opacity: parseInt(document.getElementById('pip-opacity-slider').value),
+        size: document.querySelector('.pip-size-btn.active')?.dataset.size || 'medium',
+      }],
+    }).catch(() => {}); // stale tabId (closed between polls) — card self-corrects
+  });
+
   return el('div', { class: 'now-playing' }, [
     el('div', { class: 'np-main' }, [
       thumbWrap,
@@ -576,7 +612,7 @@ function buildNowPlayingCard(video, state) {
       ]),
     ]),
     el('div', { class: 'np-controls' }, [
-      el('div', { class: 'np-media-btns' }, [rewindBtn, playPauseBtn, forwardBtn, skipBtn]),
+      el('div', { class: 'np-media-btns' }, [rewindBtn, playPauseBtn, forwardBtn, skipBtn, pipBtn]),
     ]),
   ]);
 }
@@ -600,6 +636,10 @@ async function updateNowPlaying() {
   try {
     const state = await msg({ type: 'GET_MEDIA_STATE' });
     const slot = document.getElementById('now-playing');
+
+    // PiP row knobs only apply to the Document-PiP floating player — grey
+    // them when the displayed tab affirmatively reports no support (stage 03)
+    setPipRowDisabled(!!state.videoId && state.docPipSupported === false);
 
     if (!state.videoId) {
       if (nowPlayingVideoId) {
@@ -649,6 +689,9 @@ async function updateNowPlaying() {
           ? '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><polygon points="6,3 20,12 6,21"/></svg>'
           : '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><rect x="5" y="3" width="5" height="18"/><rect x="14" y="3" width="5" height="18"/></svg>';
       }
+      // Float button reflects classic OR Document PiP being open (stage 03)
+      const pipB = slot.querySelector('#np-pip-btn');
+      if (pipB) pipB.classList.toggle('active', !!state.pipActive);
     }
 
     lastMediaState = state;
@@ -703,6 +746,7 @@ const toggleMap = {
   'tb-hiderecs': 'hideRecs',
   'tb-resize': 'playerResizeEnabled',
   'tb-inpage': 'inPageQueue',
+  'tb-autopip': 'pipAutoEnabled',
 };
 
 // Intercept: 3-state cycle (off → close → keep → off)
@@ -972,9 +1016,44 @@ document.getElementById('speed-reset').addEventListener('click', () => {
   msg({ type: 'SET_SPEED', value: 1.0, scope: 'tab' });
 });
 
+// PiP (stage 03): opacity persists on change (applied live to an open
+// floating window via the content script's storage.onChanged); size presets
+// persist the OPEN-TIME default — live resize only works from inside the
+// PiP window itself, where resizeTo() is gesture-legal
+document.getElementById('pip-opacity-slider').addEventListener('input', e => {
+  document.getElementById('pip-opacity-value').textContent = e.target.value + '%';
+});
+document.getElementById('pip-opacity-slider').addEventListener('change', e => {
+  msg({ type: 'UPDATE_SETTINGS', settings: { pipOpacity: parseInt(e.target.value) } });
+});
+document.querySelectorAll('.pip-size-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.pip-size-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    msg({ type: 'UPDATE_SETTINGS', settings: { pipSize: btn.dataset.size } });
+  });
+});
+
+// PiP row enable/disable (stage 03) — greyed only when a DISPLAYED tab
+// affirmatively reports no Document-PiP support (state.videoId present and
+// docPipSupported false); with no tab displayed the knobs stay editable as
+// open-time defaults. Tri-state cache so the DOM is only touched on change.
+let pipRowDisabled = null;
+function setPipRowDisabled(disabled) {
+  if (pipRowDisabled === disabled) return;
+  pipRowDisabled = disabled;
+  document.getElementById('pip-opacity-slider').disabled = disabled;
+  document.querySelectorAll('.pip-size-btn').forEach(b => { b.disabled = disabled; });
+  const row = document.querySelector('.ctrl-row--pip');
+  row.classList.toggle('pip-row-disabled', disabled);
+  row.title = disabled
+    ? 'Floating player not supported on this tab (Document picture-in-picture needs Chrome 116+)'
+    : '';
+}
+
 // Mid-drag guard: while the user is on the thumb, storage echoes (including
 // their own gesture's write) must not fight the pointer (stage 02)
-for (const sliderId of ['volume-slider', 'speed-slider']) {
+for (const sliderId of ['volume-slider', 'speed-slider', 'pip-opacity-slider']) {
   const slider = document.getElementById(sliderId);
   slider.addEventListener('pointerdown', () => { slider.dataset.dragging = '1'; });
   slider.addEventListener('pointerup', () => { delete slider.dataset.dragging; });
@@ -1066,6 +1145,19 @@ chrome.storage.onChanged.addListener((changes, area) => {
     }
     document.getElementById('tb-resize').classList.toggle('active', s.playerResizeEnabled !== false);
     document.getElementById('tb-inpage').classList.toggle('active', !!s.inPageQueue);
+    // PiP controls (stage 03): stay in lockstep with settings written from
+    // the PiP window's own strip (or another panel window)
+    document.getElementById('tb-autopip').classList.toggle('active', !!s.pipAutoEnabled);
+    const pos = document.getElementById('pip-opacity-slider');
+    if (!pos.dataset.dragging && s.pipOpacity !== undefined) {
+      const op = Math.min(100, Math.max(30, s.pipOpacity));
+      pos.value = op;
+      document.getElementById('pip-opacity-value').textContent = op + '%';
+    }
+    if (s.pipSize) {
+      document.querySelectorAll('.pip-size-btn').forEach(b =>
+        b.classList.toggle('active', b.dataset.size === s.pipSize));
+    }
     // Another panel window (or a persisted echo of our own click): apply only
     // on a real change — the local click already applied its mode pre-write
     const mode = s.panelMode === 'slim' ? 'slim' : 'full';

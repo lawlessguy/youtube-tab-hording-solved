@@ -767,8 +767,14 @@ async function handleMessage(message, sender) {
 
     case MSG.GET_MEDIA_STATE: {
       // Every return includes tabId so the panel can route media commands
-      // back to the tab it is actually displaying
-      const empty = { paused: true, currentTime: 0, duration: 0, videoId: null, tabId: null };
+      // back to the tab it is actually displaying. Stage 03: content-script
+      // responses now also carry pipActive/docPipSupported — the queryTab
+      // spread passes them through untouched, and the empty fallback mirrors
+      // them with false defaults (contract section 3).
+      const empty = {
+        paused: true, currentTime: 0, duration: 0, videoId: null, tabId: null,
+        pipActive: false, docPipSupported: false,
+      };
 
       async function queryTab(tabId) {
         try {
@@ -951,6 +957,9 @@ async function handleMessage(message, sender) {
           return await chrome.tabs.sendMessage(targetId, {
             type: MSG.MEDIA_COMMAND,
             action: message.action,
+            // Optional forward/rewind override (contract: default 10 in the
+            // content script when absent)
+            seconds: message.seconds,
           });
         } catch {}
       }

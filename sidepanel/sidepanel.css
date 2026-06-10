@@ -162,6 +162,21 @@ header {
   box-shadow: 0 0 0 1px rgba(255,0,0,0.3);
 }
 
+/* PiP row (stage 03): floating-player opacity + S/M/L open-size presets */
+.pip-size-btns { display: flex; gap: 3px; flex-shrink: 0; }
+.pip-size-btn {
+  background: var(--bg-card); border: 1px solid var(--border); color: var(--text2);
+  border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 600;
+  cursor: pointer; transition: all 0.15s;
+}
+.pip-size-btn:hover { color: var(--text); border-color: #555; }
+.pip-size-btn.active { color: var(--text); border-color: var(--accent); background: var(--accent-dim); }
+.ctrl-row--pip .ctrl-val { min-width: 34px; }
+/* Greyed when the displayed tab reports no Document-PiP support */
+.ctrl-row--pip.pip-row-disabled { opacity: 0.45; }
+.ctrl-row--pip.pip-row-disabled .pip-size-btn,
+.ctrl-row--pip.pip-row-disabled .slider { cursor: default; }
+
 .sort-btns { display: flex; gap: 3px; align-items: center; }
 
 /* Four sort buttons must fit a 350px row (stage 06 added Suggest) */
@@ -312,6 +327,12 @@ header {
 .np-btn--skip { border-color: var(--accent); }
 .np-btn--skip:hover { background: var(--accent-dim); color: var(--text); }
 .np-btn-label { position: absolute; font-size: 6px; font-weight: 700; bottom: 3px; }
+
+/* Now-playing float button (stage 03) — blue family to distinguish from the
+   red media controls; .active while any PiP (classic or Document) is open */
+.np-btn--pip { border-color: var(--collect); }
+.np-btn--pip:hover { background: var(--collect-dim); color: var(--text); }
+.np-btn--pip.active { color: var(--collect); background: var(--collect-dim); }
 
 /* Content Tabs (Videos / Shorts) */
 .content-tabs {

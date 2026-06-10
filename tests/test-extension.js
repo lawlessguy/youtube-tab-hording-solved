@@ -127,6 +127,14 @@ async function run() {
   check('Resize toggle active by default (playerResizeEnabled true)',
     await sidePanel.evaluate(() => document.getElementById('tb-resize').classList.contains('active')));
 
+  // PiP (stage 03): opacity slider + size presets row, auto-PiP toggle in the
+  // secondary toggle-bar row between Resize and Export (contract order)
+  check('PiP opacity slider present', !!(await sidePanel.$('#pip-opacity-slider')));
+  check('Auto-PiP toggle present with data-desc', !!(await sidePanel.$('#tb-autopip[data-desc]')));
+  check('Auto-PiP toggle sits between Resize and Export',
+    !!(await sidePanel.$('.toggle-bar--secondary #tb-resize ~ #tb-autopip')) &&
+    !!(await sidePanel.$('.toggle-bar--secondary #tb-autopip ~ #tb-export')));
+
   // Viewing modes (stage 01): slim-mode header toggle + Strip button first in
   // the secondary toggle-bar row (contract order: Strip / Resize / PiP / Export)
   check('Panel mode toggle present in header', !!(await sidePanel.$('header #panel-mode-toggle')));
