@@ -72,6 +72,28 @@ async function whitelistExtensionTab(tabId, ttlMs) {
   persistSessionState();
 }
 
+// --- Queue Sessions (yt_sessions) ---
+// Contract: a video's missing sessionId reads as 'main' EVERYWHERE — onInstalled
+// backfills once, but the worker can be updated mid-session without a reinstall.
+
+function sessOf(v) { return v.sessionId || 'main'; }
+
+function normalizeSessions(s) {
+  return (s && Array.isArray(s.list) && s.list.length) ? s : structuredClone(DEFAULT_SESSIONS);
+}
+
+async function getSessions() {
+  return normalizeSessions(await storage.get(STORAGE_KEYS.SESSIONS));
+}
+
+async function getActiveSessionId() {
+  return (await getSessions()).activeId || 'main';
+}
+
+function newSessionId() {
+  return 's_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
 // --- Initialization ---
 
 // One-time normalization of legacy queue entries (contract: sessionId missing
@@ -266,19 +288,25 @@ async function logVideoSilently(url, videoId, starred) {
 
 // --- Video Queue ---
 
-// opts is the reconciled extension point (integration contract §4): this
-// stage adds { bumpCount = true }; later stages add { source, sessionId }
+// opts is the reconciled extension point (integration contract §4):
+// { bumpCount = true } (stage 05), { sessionId = active session, resolved
+// inside } (stage 04); stage 06 adds { source }. The same videoId may exist
+// once PER SESSION — the duplicate check is scoped to the resolved session.
 async function addVideoToQueue(url, videoId, explicitTimestamp, starred, opts = {}) {
   const { bumpCount = true } = opts;
   videoId = videoId || extractVideoId(url);
   if (!videoId) return null;
+
+  // Read (not a mutation) — fine outside the mutex; callers with many adds
+  // (COLLECT_TABS) resolve once and pass opts.sessionId to skip this read
+  const sessionId = opts.sessionId || await getActiveSessionId();
 
   // Insert a placeholder atomically (no network inside the storage lock),
   // then fill in metadata in the background. Two simultaneous adds of the
   // same video can no longer both pass the duplicate check.
   let inserted = null;
   await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
-    const existing = videos.find(v => v.id === videoId);
+    const existing = videos.find(v => v.id === videoId && sessOf(v) === sessionId);
     if (existing) {
       existing.addedAt = explicitTimestamp || Date.now();
       // addCount = "times added or moved to top" — re-add/re-open/intercept
@@ -300,6 +328,7 @@ async function addVideoToQueue(url, videoId, explicitTimestamp, starred, opts = 
       isShort: isShortUrl(url),
       watched: false,
       starred: !!starred,
+      sessionId,
       addCount: 1,
     };
     videos.push(inserted);
@@ -499,14 +528,20 @@ async function handleMessage(message, sender) {
     }
 
     case MSG.REMOVE_VIDEO: {
+      // Optional sessionId scopes the match (panel always sends it); without
+      // it, legacy all-entries-by-id behavior (content script callers)
+      const matches = v => v.id === message.videoId &&
+        (!message.sessionId || sessOf(v) === message.sessionId);
       await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) =>
-        videos.filter(v => v.id !== message.videoId));
+        videos.filter(v => !matches(v)));
       return { success: true };
     }
 
     case MSG.UPDATE_VIDEO: {
+      const matches = v => v.id === message.videoId &&
+        (!message.sessionId || sessOf(v) === message.sessionId);
       await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
-        const video = videos.find(v => v.id === message.videoId);
+        const video = videos.find(matches);
         if (!video) return undefined;
         Object.assign(video, message.updates);
         return videos;
@@ -524,6 +559,9 @@ async function handleMessage(message, sender) {
       const ytTabs = tabs.filter(t => t.url && isYouTubeUrl(t.url));
       let added = 0;
 
+      // Collect lands in the ACTIVE session — resolve once, not per tab
+      const sid = await getActiveSessionId();
+
       // Assign timestamps so first tab gets highest value (appears first in desc sort)
       const baseTime = Date.now();
       for (let i = 0; i < ytTabs.length; i++) {
@@ -531,7 +569,7 @@ async function handleMessage(message, sender) {
         const videoId = extractVideoId(tab.url);
         if (videoId) {
           const timestamp = baseTime + (ytTabs.length - i);
-          const video = await addVideoToQueue(tab.url, videoId, timestamp, undefined, { bumpCount: false });
+          const video = await addVideoToQueue(tab.url, videoId, timestamp, undefined, { bumpCount: false, sessionId: sid });
           if (video) added++;
         }
       }
@@ -544,7 +582,7 @@ async function handleMessage(message, sender) {
         return [];
       });
       for (const entry of drained) {
-        const video = await addVideoToQueue(entry.url, entry.id, entry.timestamp, entry.starred, { bumpCount: false });
+        const video = await addVideoToQueue(entry.url, entry.id, entry.timestamp, entry.starred, { bumpCount: false, sessionId: sid });
         if (video) added++;
       }
 
@@ -732,6 +770,24 @@ async function handleMessage(message, sender) {
     }
 
     case MSG.OPEN_VIDEO: {
+      // Smart play: if the video is already open in some tab, focus that tab
+      // instead of navigating/creating one. extractVideoId rejects non-YouTube
+      // hosts internally, so lookalike domains can never be focused. No
+      // whitelisting needed — nothing navigates on this path.
+      const targetVid = extractVideoId(message.url);
+      if (targetVid) {
+        const all = await chrome.tabs.query({});
+        const matchTabs = all.filter(t => t.url && isYouTubeHost(t.url) && extractVideoId(t.url) === targetVid);
+        if (matchTabs.length > 0) {
+          // Prefer a match in the last-focused window, else the first match
+          const [act] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+          const pick = (act && matchTabs.find(t => t.windowId === act.windowId)) || matchTabs[0];
+          await chrome.tabs.update(pick.id, { active: true });
+          try { await chrome.windows.update(pick.windowId, { focused: true }); } catch {}
+          return { tabId: pick.id, focused: true };
+        }
+      }
+
       // Smart open: replace current YT tab or open new tab
       const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       if (activeTab && isYouTubeHost(activeTab.url)) {
@@ -811,14 +867,16 @@ async function handleMessage(message, sender) {
     case MSG.SKIP_VIDEO: {
       const currentVideoId = message.videoId;
 
-      // Mark current as watched if it's in the queue
+      // Mark current as watched if it's in the queue — ALL entries with that
+      // id, across sessions ("I watched it" is a fact about the video)
       let marked = false;
       const videos = await storage.update(STORAGE_KEYS.VIDEOS, (vids = []) => {
         if (currentVideoId) {
-          const video = vids.find(v => v.id === currentVideoId);
-          if (video && !video.watched) {
-            video.watched = true;
-            marked = true;
+          for (const video of vids) {
+            if (video.id === currentVideoId && !video.watched) {
+              video.watched = true;
+              marked = true;
+            }
           }
         }
         return vids;
@@ -833,10 +891,12 @@ async function handleMessage(message, sender) {
         if (v) { nextVideo = v; break; }
       }
 
-      // Fallback: use default sort if no list provided
+      // Fallback: use default sort if no list provided — scoped to the active
+      // session so skip never jumps into a hidden session's video
       if (!nextVideo) {
         const settings = await storage.get(STORAGE_KEYS.SETTINGS) || DEFAULT_SETTINGS;
-        const unwatched = videos.filter(v => !v.watched);
+        const activeSessionId = await getActiveSessionId();
+        const unwatched = videos.filter(v => !v.watched && sessOf(v) === activeSessionId);
         const sorted = sortVideosList(unwatched, settings.sortBy || 'addedAt', settings.sortDirection || 'desc');
         if (sorted.length > 0) nextVideo = sorted[0];
       }
@@ -870,13 +930,17 @@ async function handleMessage(message, sender) {
     }
 
     case MSG.MARK_WATCHED: {
+      // Content-script callers have no session context — mark EVERY entry
+      // with this id, across all sessions (contract §3)
       let changed = false;
       await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
-        const video = videos.find(v => v.id === message.videoId);
-        if (!video || video.watched) return undefined;
-        video.watched = true;
-        changed = true;
-        return videos;
+        for (const video of videos) {
+          if (video.id === message.videoId && !video.watched) {
+            video.watched = true;
+            changed = true;
+          }
+        }
+        return changed ? videos : undefined;
       });
       if (changed) broadcast({ type: MSG.VIDEOS_UPDATED });
       return { success: true };
@@ -898,9 +962,11 @@ async function handleMessage(message, sender) {
         }
       }
 
-      // Fallback
+      // Fallback — active session only (the stored panel order is already
+      // session-filtered; this path must match that scoping)
       if (!nextVideo) {
-        const unwatched = videos.filter(v => !v.watched);
+        const activeSessionId = await getActiveSessionId();
+        const unwatched = videos.filter(v => !v.watched && sessOf(v) === activeSessionId);
         const sorted = sortVideosList(unwatched, settings.sortBy || 'addedAt', settings.sortDirection || 'desc');
         if (sorted.length > 0) nextVideo = sorted[0];
       }
@@ -914,6 +980,123 @@ async function handleMessage(message, sender) {
         }
       }
       return { autoPlayed: false };
+    }
+
+    // --- Sessions (yt_sessions) ---
+    // All session mutations go through storage.update; the module-global
+    // writeQueue in utils/storage.js serializes across keys, so the ordered
+    // videos-then-sessions updates in DELETE/MERGE never interleave.
+
+    case MSG.GET_SESSIONS:
+      return await getSessions();
+
+    case MSG.CREATE_SESSION: {
+      const name = (message.name || '').trim().slice(0, 40);
+      if (!name) return { error: 'Empty name' };
+      const session = { id: newSessionId(), name, createdAt: Date.now() };
+      const updated = await storage.update(STORAGE_KEYS.SESSIONS, (s) => {
+        s = normalizeSessions(s);
+        s.list.push(session);
+        s.activeId = session.id; // creating switches to it
+        return s;
+      });
+      // Stage 06 seam: append the session_created/session_switched activity
+      // event here (single call site)
+      return { session, activeId: updated.activeId };
+    }
+
+    case MSG.RENAME_SESSION: {
+      if (message.sessionId === 'main') return { error: 'Cannot rename Main' };
+      const name = (message.name || '').trim().slice(0, 40);
+      if (!name) return { error: 'Empty name' };
+      let found = false;
+      await storage.update(STORAGE_KEYS.SESSIONS, (s) => {
+        s = normalizeSessions(s);
+        const entry = s.list.find(x => x.id === message.sessionId);
+        if (!entry) return undefined;
+        found = true;
+        entry.name = name;
+        return s;
+      });
+      return found ? { success: true } : { error: 'Not found' };
+    }
+
+    case MSG.SET_ACTIVE_SESSION: {
+      let activeId = null;
+      await storage.update(STORAGE_KEYS.SESSIONS, (s) => {
+        s = normalizeSessions(s);
+        if (!s.list.some(x => x.id === message.sessionId)) return undefined;
+        s.activeId = message.sessionId;
+        activeId = s.activeId;
+        return s;
+      });
+      if (!activeId) return { error: 'Not found' };
+      // Stage 06 seam: append the session_switched activity event here
+      return { success: true, activeId };
+    }
+
+    case MSG.DELETE_SESSION: {
+      const sid = message.sessionId;
+      if (sid === 'main') return { error: 'Cannot delete Main' };
+      const sessions = await getSessions();
+      if (!sessions.list.some(x => x.id === sid)) return { error: 'Not found' };
+      // Order is load-bearing: videos FIRST, session entry SECOND. A worker
+      // death in between leaves an empty-but-listed session (visible, user
+      // can delete again); the reverse would orphan invisible videos.
+      let removed = 0;
+      await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
+        const kept = videos.filter(v => sessOf(v) !== sid);
+        removed = videos.length - kept.length;
+        return kept;
+      });
+      await storage.update(STORAGE_KEYS.SESSIONS, (s) => {
+        s = normalizeSessions(s);
+        s.list = s.list.filter(x => x.id !== sid);
+        if (s.activeId === sid) s.activeId = 'main';
+        return s;
+      });
+      // Stage 06 seam: append the session_deleted activity event here
+      broadcast({ type: MSG.VIDEOS_UPDATED });
+      return { success: true, removedVideos: removed };
+    }
+
+    case MSG.MERGE_SESSION: {
+      const sid = message.sourceSessionId;
+      if (sid === 'main') return { error: 'Cannot merge Main into itself' };
+      const sessions = await getSessions();
+      if (!sessions.list.some(x => x.id === sid)) return { error: 'Not found' };
+      // Move source videos into Main. Duplicate ids: the Main entry wins
+      // (keeps its addedAt ordering), starred is OR'd, watched is AND'd
+      // (unwatched in either ⇒ unwatched). Videos first, sessions second.
+      let moved = 0, duplicates = 0;
+      await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
+        const mainIds = new Map(videos.filter(v => sessOf(v) === 'main').map(v => [v.id, v]));
+        const out = [];
+        for (const v of videos) {
+          if (sessOf(v) !== sid) { out.push(v); continue; }
+          const dup = mainIds.get(v.id);
+          if (dup) {
+            duplicates++;
+            dup.starred = dup.starred || v.starred;
+            dup.watched = dup.watched && v.watched;
+          } else {
+            moved++;
+            const mv = { ...v, sessionId: 'main' };
+            out.push(mv);
+            mainIds.set(mv.id, mv);
+          }
+        }
+        return out;
+      });
+      await storage.update(STORAGE_KEYS.SESSIONS, (s) => {
+        s = normalizeSessions(s);
+        s.list = s.list.filter(x => x.id !== sid);
+        s.activeId = 'main';
+        return s;
+      });
+      // Stage 06 seam: append the session_merged activity event here
+      broadcast({ type: MSG.VIDEOS_UPDATED });
+      return { success: true, moved, duplicates };
     }
 
     case MSG.OPEN_SIDE_PANEL: {

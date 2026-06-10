@@ -23,6 +23,16 @@
         </button>
       </header>
 
+      <!-- Session Switcher (no prompt()/confirm() in panels: inline input + two-click confirm) -->
+      <div class="session-bar">
+        <select id="session-select" class="session-select" title="Active session"></select>
+        <input type="text" id="session-name-input" class="session-name-input" style="display:none" maxlength="40" spellcheck="false">
+        <button class="session-btn" id="session-new" title="New session">+</button>
+        <button class="session-btn" id="session-rename" title="Rename session">&#9998;</button>
+        <button class="session-btn" id="session-merge" title="Merge this session into Main">&#8689;</button>
+        <button class="session-btn session-btn--danger" id="session-delete" title="Delete session and its videos">&#10005;</button>
+      </div>
+
       <!-- Toggle Bar: All buttons, same size, labeled -->
       <div class="toggle-bar">
         <button class="tb-btn tb-btn--collect" id="collect-tabs" data-desc="Collect all open YouTube tabs into the queue">
@@ -88,6 +98,15 @@
             <svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
         </div>
+      </div>
+
+      <!-- Channel filter chip (hidden unless a channel filter is active) -->
+      <div class="channel-chip" id="channel-chip" style="display:none">
+        <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+        <span class="channel-chip-name" id="channel-chip-name"></span>
+        <button class="search-clear" id="channel-chip-clear" title="Clear channel filter">
+          <svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
       </div>
 
       <!-- Videos / Shorts Tabs -->

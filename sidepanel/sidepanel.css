@@ -451,6 +451,38 @@ header {
 
 .empty-state { text-align: center; padding: 20px 10px; color: var(--text2); font-size: 12px; }
 
+/* Session Switcher */
+.session-bar { display: flex; align-items: center; gap: 4px; padding: 6px 0 0; }
+.session-select, .session-name-input {
+  flex: 1; min-width: 0; background: var(--bg-card); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px; font-size: 11px;
+  padding: 3px 4px; font-family: inherit; outline: none;
+}
+.session-select:hover { border-color: #555; }
+.session-name-input:focus { border-color: var(--accent); }
+.session-btn {
+  background: none; border: 1px solid var(--border); color: var(--text2);
+  border-radius: 4px; width: 24px; height: 22px; font-size: 11px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; transition: all 0.15s; flex-shrink: 0;
+}
+.session-btn:hover { color: var(--text); background: var(--bg-hover); border-color: #555; }
+.session-btn:disabled { opacity: 0.35; cursor: default; }
+.session-btn--danger:hover { color: var(--danger); border-color: var(--danger); }
+.session-btn.confirming { color: #fff; background: var(--danger); border-color: var(--danger); }
+#session-merge.confirming { background: var(--collect); border-color: var(--collect); }
+
+/* Channel filter chip */
+.channel-chip {
+  display: flex; align-items: center; gap: 5px; margin-bottom: 5px;
+  padding: 3px 7px; border: 1px solid var(--accent); border-radius: 10px;
+  background: var(--accent-dim); color: var(--text); font-size: 11px;
+}
+.channel-chip-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+
+/* Clickable channel on cards */
+.channel-link { cursor: pointer; }
+.channel-link:hover { color: var(--text); text-decoration: underline; }
+
 /* Scrollbar */
 ::-webkit-scrollbar { width: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }

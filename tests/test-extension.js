@@ -99,6 +99,18 @@ async function run() {
   check('Sticky top present', !!(await sidePanel.$('.sticky-top')));
   check('Scroll area present', !!(await sidePanel.$('.scroll-area')));
 
+  // Session bar + channel chip (stage 04 list-panel)
+  check('Session select present', !!(await sidePanel.$('#session-select')));
+  check('Session new button present', !!(await sidePanel.$('#session-new')));
+  check('Session rename button present', !!(await sidePanel.$('#session-rename')));
+  check('Session merge button present', !!(await sidePanel.$('#session-merge')));
+  check('Session delete button present', !!(await sidePanel.$('#session-delete')));
+  const chipHidden = await sidePanel.evaluate(() => {
+    const chip = document.getElementById('channel-chip');
+    return chip ? getComputedStyle(chip).display === 'none' : null;
+  });
+  check('Channel chip present but hidden by default', chipHidden === true);
+
   await sidePanel.screenshot({ path: path.join(screenshotDir, 'sidepanel.png') });
   console.log('  Screenshot: screenshots/sidepanel.png');
 

@@ -122,6 +122,29 @@ function check(label, condition, detail) {
   check('Update 2 applied (starred)', finalState.v3starred === true);
   check('Removes applied', finalState.v2gone && finalState.v4gone);
 
+  // --- Test 5: concurrent CREATE_SESSION must not lose sessions ---
+  console.log('\n--- Race 5: 10 concurrent CREATE_SESSION ---');
+  await sw.evaluate(() => chrome.storage.local.set({
+    yt_sessions: { activeId: 'main', list: [{ id: 'main', name: 'Main', createdAt: 0 }] },
+  }));
+  await page.evaluate(async () => {
+    const sends = [];
+    for (let i = 0; i < 10; i++) {
+      sends.push(chrome.runtime.sendMessage({ type: 'CREATE_SESSION', name: 'Race ' + i }));
+    }
+    await Promise.all(sends);
+  });
+  const sessState = await sw.evaluate(async () => {
+    const r = await chrome.storage.local.get('yt_sessions');
+    return r.yt_sessions;
+  });
+  check('All 10 sessions created (got ' + (sessState.list.length - 1) + ')',
+    sessState.list.length === 11);
+  check('All session ids distinct',
+    new Set(sessState.list.map(s => s.id)).size === sessState.list.length);
+  check('activeId points at an existing session',
+    sessState.list.some(s => s.id === sessState.activeId));
+
   await context.close();
 
   console.log('\n=============================');

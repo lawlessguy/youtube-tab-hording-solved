@@ -8,7 +8,16 @@ let searchQuery = '';
 let starFilterActive = false;
 let nowPlayingVideoId = null;
 let lastMediaState = null;
-let cachedVideos = [];
+let cachedVideos = []; // ACTIVE-SESSION videos only (see loadVideos)
+// Channel filter is deliberately ephemeral (like search): cleared on panel
+// reload and on session switch — never persisted
+let channelFilter = null;
+// Sessions: global active pointer in yt_sessions; missing video.sessionId
+// reads as 'main' everywhere (contract rule)
+let activeSessionId = 'main';
+let sessionsCache = { activeId: 'main', list: [{ id: 'main', name: 'Main', createdAt: 0 }] };
+let sessionInputMode = null; // 'new' | 'rename' | null
+let confirmTimer = null;
 // videoIds currently open in any Chrome tab — worker-maintained, read from
 // chrome.storage.session (worker is the sole writer; see loadOpenTabIds)
 let openTabIds = new Set();
@@ -130,16 +139,64 @@ async function loadSettings() {
   } catch {}
 }
 
+// --- Sessions ---
+async function loadSessions() {
+  try {
+    const s = await msg({ type: 'GET_SESSIONS' });
+    if (s && Array.isArray(s.list) && s.list.length) sessionsCache = s;
+  } catch {}
+  activeSessionId = sessionsCache.activeId || 'main';
+  renderSessionBar();
+}
+
+function renderSessionBar() {
+  const select = document.getElementById('session-select');
+  select.textContent = '';
+  for (const s of sessionsCache.list || []) {
+    select.appendChild(el('option', { value: s.id, text: s.name }));
+  }
+  select.value = activeSessionId;
+  const isMain = activeSessionId === 'main';
+  document.getElementById('session-rename').disabled = isMain;
+  document.getElementById('session-merge').disabled = isMain;
+  document.getElementById('session-delete').disabled = isMain;
+  // Any pending two-click confirm is stale after a re-render
+  document.querySelectorAll('.session-bar .confirming').forEach(b => b.classList.remove('confirming'));
+}
+
+function activeSessionName() {
+  return (sessionsCache.list || []).find(s => s.id === activeSessionId)?.name || '';
+}
+
+// --- Channel Filter ---
+function setChannelFilter(name) {
+  channelFilter = name;
+  document.getElementById('channel-chip-name').textContent = name; // user data — textContent only
+  document.getElementById('channel-chip').style.display = '';
+  loadVideos();
+  document.querySelector('.scroll-area').scrollTop = 0;
+}
+
+function clearChannelFilter(reload = true) {
+  channelFilter = null;
+  document.getElementById('channel-chip').style.display = 'none';
+  if (reload) loadVideos();
+}
+
 // --- Videos ---
 async function loadVideos() {
   try {
     const allVideos = await msg({ type: 'GET_VIDEOS' });
-    cachedVideos = allVideos;
-    const unwatched = allVideos.filter(v => !v.watched);
-    const watched = allVideos.filter(v => v.watched);
+    // Panel shows exactly one session; other sessions' videos stay untouched
+    // in storage (SET_VIDEOS round-trips the full array)
+    const sessionVideos = allVideos.filter(v => (v.sessionId || 'main') === activeSessionId);
+    cachedVideos = sessionVideos;
+    const unwatched = sessionVideos.filter(v => !v.watched);
+    const watched = sessionVideos.filter(v => v.watched);
 
     let filtered = unwatched;
     if (starFilterActive) filtered = filtered.filter(v => v.starred);
+    if (channelFilter) filtered = filtered.filter(v => (v.channel || '') === channelFilter);
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       filtered = filtered.filter(v =>
@@ -319,10 +376,12 @@ function buildVideoItem(v, _unused, isWatched) {
   const playBtn = el('button', { class: 'card-play-btn', text: '\u25B6' });
   playBtn.addEventListener('click', e => { e.stopPropagation(); openVideo(v.url); });
 
+  // Card mutations carry sessionId so a same-id entry in ANOTHER session is
+  // never the one removed/updated (worker matches (id, sessionId) when sent)
   const removeBtn = el('button', { class: 'card-sm-btn', text: '\u2715' });
   removeBtn.addEventListener('click', e => {
     e.stopPropagation();
-    msg({ type: 'REMOVE_VIDEO', videoId: v.id }).then(loadVideos);
+    msg({ type: 'REMOVE_VIDEO', videoId: v.id, sessionId: activeSessionId }).then(loadVideos);
   });
 
   let watchBtn;
@@ -330,13 +389,13 @@ function buildVideoItem(v, _unused, isWatched) {
     watchBtn = el('button', { class: 'card-sm-btn', text: '\u21A9' });
     watchBtn.addEventListener('click', e => {
       e.stopPropagation();
-      msg({ type: 'UPDATE_VIDEO', videoId: v.id, updates: { watched: false } }).then(loadVideos);
+      msg({ type: 'UPDATE_VIDEO', videoId: v.id, sessionId: activeSessionId, updates: { watched: false } }).then(loadVideos);
     });
   } else {
     watchBtn = el('button', { class: 'card-sm-btn', text: '\u2713' });
     watchBtn.addEventListener('click', e => {
       e.stopPropagation();
-      msg({ type: 'UPDATE_VIDEO', videoId: v.id, updates: { watched: true } }).then(loadVideos);
+      msg({ type: 'UPDATE_VIDEO', videoId: v.id, sessionId: activeSessionId, updates: { watched: true } }).then(loadVideos);
     });
   }
 
@@ -344,11 +403,21 @@ function buildVideoItem(v, _unused, isWatched) {
   starBtn.addEventListener('click', e => {
     e.stopPropagation();
     const newVal = !v.starred;
-    msg({ type: 'UPDATE_VIDEO', videoId: v.id, updates: { starred: newVal } }).then(loadVideos);
+    msg({ type: 'UPDATE_VIDEO', videoId: v.id, sessionId: activeSessionId, updates: { starred: newVal } }).then(loadVideos);
   });
 
+  // Channel name filters on click \u2014 but never for empty/'Unknown' placeholders
+  // (filtering by a placeholder groups unrelated unenriched videos)
+  let chanSpan;
+  if (v.channel && v.channel !== 'Unknown') {
+    chanSpan = el('span', { class: 'channel-link', title: 'Filter by ' + v.channel, text: v.channel });
+    chanSpan.addEventListener('click', e => { e.stopPropagation(); setChannelFilter(v.channel); });
+  } else {
+    chanSpan = el('span', { text: v.channel || 'Unknown' });
+  }
+
   const metaChildren = [
-    el('span', { text: v.channel || 'Unknown' }),
+    chanSpan,
     el('span', { class: 'dot', text: ' ' }),
     el('span', { text: dur(v.duration) }),
     el('span', { class: 'dot', text: ' ' }),
@@ -373,7 +442,9 @@ function buildVideoItem(v, _unused, isWatched) {
   ]);
 
   item.addEventListener('dblclick', e => {
-    if (e.target.closest('select') || e.target.closest('button')) return;
+    // .channel-link guard is required: stopPropagation on its click handler
+    // does NOT suppress this independent dblclick listener
+    if (e.target.closest('select') || e.target.closest('button') || e.target.closest('.channel-link')) return;
     openVideo(v.url);
   });
 
@@ -463,12 +534,14 @@ function buildNowPlayingCard(video, state) {
 
 function handleVideoUnpinned(videoId, state) {
   if (!videoId || !state) return;
-  // Only apply 20% rule to videos that are in the queue
+  // Only apply 20% rule to videos that are in the queue (cachedVideos is
+  // session-filtered, so the rule applies to active-session videos only;
+  // other sessions' copies get marked via the content script's MARK_WATCHED)
   const inQueue = cachedVideos.some(v => v.id === videoId && !v.watched);
   if (inQueue) {
     const progress = state.duration > 0 ? state.currentTime / state.duration : 0;
     if (progress >= 0.2) {
-      msg({ type: 'UPDATE_VIDEO', videoId, updates: { watched: true } });
+      msg({ type: 'UPDATE_VIDEO', videoId, sessionId: activeSessionId, updates: { watched: true } });
     }
   }
   loadVideos();
@@ -638,9 +711,11 @@ function setupDragDrop(container) {
       item.classList.remove('drag-over');
       if (!dragId || item.dataset.id === dragId) return;
 
+      // Scope to the active session — a same-id entry in another session
+      // must never be the one swapped (full array still round-trips intact)
       const videos = await msg({ type: 'GET_VIDEOS' });
-      const dv = videos.find(v => v.id === dragId);
-      const tv = videos.find(v => v.id === item.dataset.id);
+      const dv = videos.find(v => v.id === dragId && (v.sessionId || 'main') === activeSessionId);
+      const tv = videos.find(v => v.id === item.dataset.id && (v.sessionId || 'main') === activeSessionId);
       if (!dv || !tv) return;
 
       const field = currentSort === 'duration' ? 'duration' : currentSort === 'uploadedAt' ? 'uploadedAt' : 'addedAt';
@@ -674,6 +749,97 @@ document.getElementById('search-clear').addEventListener('click', () => {
   searchQuery = '';
   document.getElementById('search-clear').style.display = 'none';
   loadVideos();
+});
+
+document.getElementById('channel-chip-clear').addEventListener('click', () => clearChannelFilter());
+
+// --- Session Bar ---
+
+document.getElementById('session-select').addEventListener('change', async e => {
+  const id = e.target.value;
+  if (id === activeSessionId) return;
+  const res = await msg({ type: 'SET_ACTIVE_SESSION', sessionId: id });
+  if (res && res.success) {
+    activeSessionId = id;
+    renderSessionBar();
+    clearChannelFilter(false); // ephemeral filter dies on session switch
+    loadVideos();
+    document.querySelector('.scroll-area').scrollTop = 0;
+  } else {
+    e.target.value = activeSessionId; // revert on rejection
+  }
+});
+
+// Inline name input replaces the select while naming (prompt() is suppressed
+// in extension panel documents). Enter commits, Esc/blur cancels.
+function enterNameMode(mode) {
+  sessionInputMode = mode;
+  const input = document.getElementById('session-name-input');
+  input.value = mode === 'rename' ? activeSessionName() : '';
+  document.getElementById('session-select').style.display = 'none';
+  input.style.display = '';
+  input.focus();
+  if (mode === 'rename') input.select();
+}
+
+function exitNameMode() {
+  sessionInputMode = null;
+  document.getElementById('session-name-input').style.display = 'none';
+  document.getElementById('session-select').style.display = '';
+}
+
+document.getElementById('session-name-input').addEventListener('keydown', async e => {
+  if (e.key === 'Enter') {
+    const mode = sessionInputMode;
+    const name = e.target.value.trim();
+    exitNameMode(); // nulls sessionInputMode first so the blur below no-ops
+    if (!mode || !name) return;
+    if (mode === 'new') {
+      await msg({ type: 'CREATE_SESSION', name });
+    } else {
+      await msg({ type: 'RENAME_SESSION', sessionId: activeSessionId, name });
+    }
+    await loadSessions();
+    loadVideos();
+  } else if (e.key === 'Escape') {
+    exitNameMode();
+  }
+});
+document.getElementById('session-name-input').addEventListener('blur', () => {
+  if (sessionInputMode) exitNameMode();
+});
+
+document.getElementById('session-new').addEventListener('click', () => enterNameMode('new'));
+document.getElementById('session-rename').addEventListener('click', () => enterNameMode('rename'));
+
+// Two-click confirm: first click arms (.confirming, 3s timeout), second runs
+function armConfirm(btn, onConfirm) {
+  if (btn.classList.contains('confirming')) {
+    btn.classList.remove('confirming');
+    if (confirmTimer) { clearTimeout(confirmTimer); confirmTimer = null; }
+    onConfirm();
+    return;
+  }
+  document.querySelectorAll('.session-bar .confirming').forEach(b => b.classList.remove('confirming'));
+  btn.classList.add('confirming');
+  if (confirmTimer) clearTimeout(confirmTimer);
+  confirmTimer = setTimeout(() => { btn.classList.remove('confirming'); confirmTimer = null; }, 3000);
+}
+
+document.getElementById('session-delete').addEventListener('click', e => {
+  armConfirm(e.currentTarget, async () => {
+    await msg({ type: 'DELETE_SESSION', sessionId: activeSessionId });
+    await loadSessions();
+    loadVideos();
+  });
+});
+
+document.getElementById('session-merge').addEventListener('click', e => {
+  armConfirm(e.currentTarget, async () => {
+    await msg({ type: 'MERGE_SESSION', sourceSessionId: activeSessionId });
+    await loadSessions();
+    loadVideos();
+  });
 });
 
 // --- Event Listeners ---
@@ -771,6 +937,16 @@ chrome.runtime.onMessage.addListener(m => { if (m.type === 'VIDEOS_UPDATED') sch
 // set arrives the same way from the SESSION area (worker is its sole writer)
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.yt_watch_time) loadWatchTime();
+  // Session list/pointer changes propagate via storage — no broadcast type;
+  // multi-window panels converge on the same global active session for free
+  if (area === 'local' && changes.yt_sessions) {
+    sessionsCache = changes.yt_sessions.newValue || sessionsCache;
+    const prev = activeSessionId;
+    activeSessionId = sessionsCache.activeId || 'main';
+    renderSessionBar();
+    if (prev !== activeSessionId) clearChannelFilter(false);
+    scheduleLoadVideos();
+  }
   if (area === 'session' && changes.yt_open_tab_ids) {
     openTabIds = new Set(changes.yt_open_tab_ids.newValue || []);
     lastRenderKeys.clear();   // virtual scroll skips unchanged range keys
@@ -794,6 +970,8 @@ document.querySelector('.scroll-area').addEventListener('scroll', () => {
 loadWatchTime();
 loadOpenTabIds();
 loadSettings();
-loadVideos();
+// Sessions FIRST so the initial render uses the correct session (a bare
+// loadVideos() would flash Main's list when another session is active)
+loadSessions().then(loadVideos);
 updateNowPlaying();
 setInterval(updateNowPlaying, 1500);
