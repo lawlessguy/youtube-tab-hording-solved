@@ -73,6 +73,7 @@ async function run() {
   check('Volume slider present', !!(await popup.$('#volume-slider')));
   check('Speed slider present', !!(await popup.$('#speed-slider')));
   check('Open side panel button present', !!(await popup.$('#open-sidepanel')));
+  check('In-page queue toggle present', !!(await popup.$('#inpage-queue-toggle')));
 
   await popup.screenshot({ path: path.join(screenshotDir, 'popup.png') });
   console.log('  Screenshot: screenshots/popup.png');
@@ -125,6 +126,16 @@ async function run() {
     !!(await sidePanel.$('.toggle-bar--secondary #tb-resize + #tb-export, .toggle-bar--secondary #tb-resize ~ #tb-export')));
   check('Resize toggle active by default (playerResizeEnabled true)',
     await sidePanel.evaluate(() => document.getElementById('tb-resize').classList.contains('active')));
+
+  // Viewing modes (stage 01): slim-mode header toggle + Strip button first in
+  // the secondary toggle-bar row (contract order: Strip / Resize / PiP / Export)
+  check('Panel mode toggle present in header', !!(await sidePanel.$('header #panel-mode-toggle')));
+  check('Strip toggle present', !!(await sidePanel.$('#tb-inpage')));
+  check('Strip toggle has data-desc', !!(await sidePanel.$('#tb-inpage[data-desc]')));
+  check('Strip toggle lives in the secondary toggle-bar row before Resize',
+    !!(await sidePanel.$('.toggle-bar--secondary #tb-inpage + #tb-resize, .toggle-bar--secondary #tb-inpage ~ #tb-resize')));
+  check('Strip toggle inactive by default (inPageQueue false)',
+    await sidePanel.evaluate(() => !document.getElementById('tb-inpage').classList.contains('active')));
 
   await sidePanel.screenshot({ path: path.join(screenshotDir, 'sidepanel.png') });
   console.log('  Screenshot: screenshots/sidepanel.png');

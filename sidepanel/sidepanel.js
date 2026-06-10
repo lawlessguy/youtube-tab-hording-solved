@@ -45,8 +45,14 @@ function channelScore(v) {
 let dataVideos = [];
 let dataShorts = [];
 let dataWatched = [];
-const CARD_HEIGHT = 63; // Approximate card height including gap
+const CARD_HEIGHT = 63;      // full mode: .video-item height (59) + margin (4)
+const SLIM_CARD_HEIGHT = 94; // slim mode: body.slim .video-item height (90) + margin (4)
 const RENDER_BUFFER = 8; // Extra cards above/below viewport
+// Panel display mode (yt_settings.panelMode). cardHeight() is the ONLY access
+// point for virtual-scroll geometry (contract ruling 10) — each mode's
+// constant must equal that mode's CSS height + margin exactly.
+let panelMode = 'full'; // 'full' | 'slim'
+function cardHeight() { return panelMode === 'slim' ? SLIM_CARD_HEIGHT : CARD_HEIGHT; }
 const lastRenderKeys = new Map(); // containerId → rendered range, avoids redundant redraws
 
 // Re-rendering while a card is being dragged destroys the dragged node and
@@ -160,6 +166,8 @@ async function loadSettings() {
     // Existing installs lack the key (onInstalled only seeds when settings
     // are absent): undefined reads as the default true
     document.getElementById('tb-resize').classList.toggle('active', s.playerResizeEnabled !== false);
+    document.getElementById('tb-inpage').classList.toggle('active', !!s.inPageQueue);
+    applyPanelMode(s.panelMode || 'full');
 
     currentSort = s.sortBy || 'addedAt';
     if (currentSort === 'custom') currentSort = 'addedAt'; // 'suggested' passes through
@@ -283,7 +291,7 @@ function setVirtualHeight(containerId, count) {
     container.style.position = '';
     return;
   }
-  container.style.height = (count * CARD_HEIGHT) + 'px';
+  container.style.height = (count * cardHeight()) + 'px';
   container.style.position = 'relative';
 }
 
@@ -329,8 +337,8 @@ function renderVirtualList(containerId, data, isWatched) {
   const containerTop = container.offsetTop;
   const relScroll = scrollTop - containerTop;
 
-  const startIdx = Math.max(0, Math.floor(relScroll / CARD_HEIGHT) - RENDER_BUFFER);
-  const endIdx = Math.min(data.length, Math.ceil((relScroll + viewportHeight) / CARD_HEIGHT) + RENDER_BUFFER);
+  const startIdx = Math.max(0, Math.floor(relScroll / cardHeight()) - RENDER_BUFFER);
+  const endIdx = Math.min(data.length, Math.ceil((relScroll + viewportHeight) / cardHeight()) + RENDER_BUFFER);
 
   // Skip if same range is already rendered
   const key = containerId + ':' + startIdx + ':' + endIdx;
@@ -338,12 +346,12 @@ function renderVirtualList(containerId, data, isWatched) {
   lastRenderKeys.set(containerId, key);
 
   container.textContent = '';
-  container.style.height = (data.length * CARD_HEIGHT) + 'px';
+  container.style.height = (data.length * cardHeight()) + 'px';
   container.style.position = 'relative';
 
   // Top spacer
   if (startIdx > 0) {
-    container.appendChild(el('div', { style: { height: (startIdx * CARD_HEIGHT) + 'px', flexShrink: '0' } }));
+    container.appendChild(el('div', { style: { height: (startIdx * cardHeight()) + 'px', flexShrink: '0' } }));
   }
 
   // Render visible cards
@@ -353,7 +361,7 @@ function renderVirtualList(containerId, data, isWatched) {
 
   // Bottom spacer
   if (endIdx < data.length) {
-    container.appendChild(el('div', { style: { height: ((data.length - endIdx) * CARD_HEIGHT) + 'px', flexShrink: '0' } }));
+    container.appendChild(el('div', { style: { height: ((data.length - endIdx) * cardHeight()) + 'px', flexShrink: '0' } }));
   }
 
   if (!isWatched && endIdx - startIdx > 0) setupDragDrop(container);
@@ -478,6 +486,9 @@ function buildVideoItem(v, _unused, isWatched) {
     ]),
     el('div', { class: 'card-right' }, [playBtn, el('div', { class: 'card-bottom-actions' }, [starBtn, removeBtn, watchBtn])]),
   ]);
+
+  // Slim tiles hide .video-info — the tooltip is the only title surface
+  if (panelMode === 'slim') item.title = v.title || '';
 
   item.addEventListener('dblclick', e => {
     // .channel-link guard is required: stopPropagation on its click handler
@@ -658,6 +669,26 @@ document.querySelectorAll('.content-tab').forEach(tab => {
   });
 });
 
+// --- Panel Mode (full / slim) ---
+// Slim mode is pure CSS (body.slim): cards become 160×86 thumbnail tiles and
+// the heavy controls collapse. JS only swaps the virtual-scroll card height
+// via cardHeight() and resets the scroller (a height change invalidates every
+// cached render range and scroll offset).
+function applyPanelMode(mode) {
+  panelMode = mode === 'slim' ? 'slim' : 'full';
+  document.body.classList.toggle('slim', panelMode === 'slim');
+  document.getElementById('panel-mode-toggle').classList.toggle('active', panelMode === 'slim');
+  lastRenderKeys.clear();
+  document.querySelector('.scroll-area').scrollTop = 0;
+  renderVisibleCards();
+}
+
+document.getElementById('panel-mode-toggle').addEventListener('click', () => {
+  const next = panelMode === 'slim' ? 'full' : 'slim';
+  applyPanelMode(next);
+  msg({ type: 'UPDATE_SETTINGS', settings: { panelMode: next } });
+});
+
 // --- Watched Section ---
 document.getElementById('watched-header').addEventListener('click', () => {
   watchedCollapsed = !watchedCollapsed;
@@ -671,6 +702,7 @@ const toggleMap = {
   'tb-videoinfo': 'showVideoInfo',
   'tb-hiderecs': 'hideRecs',
   'tb-resize': 'playerResizeEnabled',
+  'tb-inpage': 'inPageQueue',
 };
 
 // Intercept: 3-state cycle (off → close → keep → off)
@@ -1033,6 +1065,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
       document.getElementById('speed-value').textContent = fmtSpeed(s.speedLevel);
     }
     document.getElementById('tb-resize').classList.toggle('active', s.playerResizeEnabled !== false);
+    document.getElementById('tb-inpage').classList.toggle('active', !!s.inPageQueue);
+    // Another panel window (or a persisted echo of our own click): apply only
+    // on a real change — the local click already applied its mode pre-write
+    const mode = s.panelMode === 'slim' ? 'slim' : 'full';
+    if (mode !== panelMode) applyPanelMode(mode);
   }
   // Session list/pointer changes propagate via storage — no broadcast type;
   // multi-window panels converge on the same global active session for free

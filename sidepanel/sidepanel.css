@@ -488,6 +488,54 @@ header {
 .channel-link { cursor: pointer; }
 .channel-link:hover { color: var(--text); text-decoration: underline; }
 
+/* --- Slim mode (stage 01 viewing-modes) --- */
+/* Header mode toggle active state */
+#panel-mode-toggle.active { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+
+/* Collapse heavy controls — thumbnails only. Kept: header icon buttons, the
+   session bar (other sessions would be unreachable, same reasoning as
+   content-tabs), and .content-tabs (Videos/Shorts switch). */
+body.slim .watch-bar,
+body.slim .toggle-bar,
+body.slim .toggle-desc,
+body.slim .controls-bar,
+body.slim .filter-search-bar,
+body.slim .channel-chip,
+body.slim #now-playing,
+body.slim .section { display: none !important; }
+
+/* SLIM_CARD_HEIGHT invariant: tile height (90) + margin-bottom (4) = 94 —
+   must equal SLIM_CARD_HEIGHT in sidepanel.js exactly (cardHeight() is the
+   only access point for the scroller geometry) */
+body.slim .video-item {
+  width: 164px;            /* 160 thumb + 1px border + 1px centering gap per side */
+  height: 90px;            /* 86 thumb + 1px border + 1px centering gap top/bottom */
+  padding: 0;
+  margin: 0 auto 4px;
+  border-radius: 6px;
+  align-items: center;
+  justify-content: center;
+}
+body.slim .thumb-wrap,
+body.slim .video-thumb { width: 160px; height: 86px; }
+body.slim .video-thumb { border-radius: 5px; }
+body.slim .video-info { display: none; }
+
+/* Action buttons become a hover overlay. It starts 16px down the tile so the
+   stage-05 chips (.thumb-tab-badge top-left, .thumb-addcount top-right) stay
+   visible — the overlay must not cover the top 14px of the thumb (contract). */
+body.slim .card-right {
+  position: absolute; inset: 16px 0 0 0;
+  flex-direction: row; gap: 6px;
+  align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 0 0 5px 5px;
+  opacity: 0; transition: opacity 0.15s;
+}
+body.slim .video-item:hover .card-right { opacity: 1; }
+body.slim .video-item.drag-over { border-top: 2px solid var(--accent); }
+body.slim .content-tab { padding: 4px 0; font-size: 11px; }
+
 /* Scrollbar */
 ::-webkit-scrollbar { width: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }

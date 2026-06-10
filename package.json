@@ -18,7 +18,8 @@
     "test:sessions": "node tests/test-sessions.js",
     "test:analytics": "node tests/test-analytics.js",
     "test:player": "node tests/test-player.js",
-    "test:all": "node tests/test-extension.js && node tests/test-races.js && node tests/test-virtual-scroll.js && node tests/test-url-validation.js && node tests/test-event-driven.js && node tests/test-panel-gesture.js && node tests/test-media-routing.js && node tests/test-tab-management.js && node tests/test-status-indicators.js && node tests/test-sessions.js && node tests/test-analytics.js && node tests/test-player.js",
+    "test:modes": "node tests/test-viewing-modes.js",
+    "test:all": "node tests/test-extension.js && node tests/test-races.js && node tests/test-virtual-scroll.js && node tests/test-url-validation.js && node tests/test-event-driven.js && node tests/test-panel-gesture.js && node tests/test-media-routing.js && node tests/test-tab-management.js && node tests/test-status-indicators.js && node tests/test-sessions.js && node tests/test-analytics.js && node tests/test-player.js && node tests/test-viewing-modes.js",
     "generate-icons": "node scripts/generate-icons.js"
   },
   "devDependencies": {

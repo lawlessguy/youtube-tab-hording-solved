@@ -141,6 +141,23 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* In-page queue strip toggle (stage 01) — native checkbox stays visible so
+   tests can click it without { force: true } */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 2px 10px;
+  cursor: pointer;
+}
+
+.toggle-row input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
 .btn-primary {
   width: 100%;
   background: var(--bg-card);

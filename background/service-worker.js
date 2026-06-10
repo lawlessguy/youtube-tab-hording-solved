@@ -1274,17 +1274,21 @@ async function handleMessage(message, sender) {
     }
 
     case MSG.OPEN_SIDE_PANEL: {
-      if (message.tabId) {
+      // Sender fallback (stage 01): the in-page queue strip's "+N" pill is a
+      // content-script caller that doesn't know its own tabId. Existing popup
+      // callers (which pass tabId explicitly) are unaffected.
+      const tabId = message.tabId ?? sender.tab?.id;
+      if (tabId) {
         // Re-enable (with path — see updateSidePanelForTab) in case this tab
         // was disabled as non-YouTube. MUST be fire-and-forget: this handler
         // runs synchronously off the message event and open() needs the
         // caller's user gesture — any await before it consumes the gesture.
         chrome.sidePanel.setOptions({
-          tabId: message.tabId,
+          tabId,
           enabled: true,
           path: 'sidepanel/sidepanel.html',
         }).catch(() => {});
-        await chrome.sidePanel.open({ tabId: message.tabId });
+        await chrome.sidePanel.open({ tabId });
       }
       return { success: true };
     }

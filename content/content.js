@@ -1088,6 +1088,186 @@
     }
   }
 
+  // --- In-Page Queue Strip (stage 01 viewing-modes) ---
+  // A horizontal strip of queue thumbnails injected into the YouTube masthead
+  // (between #center and #end). Contract ruling 2: the strip shows the ACTIVE
+  // session only — it reads yt_sessions + yt_videos straight from storage
+  // (content scripts do not receive the worker's VIDEOS_UPDATED runtime
+  // broadcast) and re-renders on storage.onChanged of EITHER key.
+
+  const YTM_IPQ_STYLE_ID = 'ytm-inpage-queue-style';
+  const IPQ_MAX_TILES = 30; // hard cap + "+N" overflow pill — no virtualization
+  let lastKnownVideos = [];
+  let ipqActiveSessionId = 'main';
+
+  function injectInPageQueueStyles() {
+    if (document.getElementById(YTM_IPQ_STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = YTM_IPQ_STYLE_ID;
+    // Theme-neutral: tiles are images with dark translucent overlays — no
+    // background on the container, so light and dark YouTube both work
+    style.textContent = `
+      #ytm-inpage-queue {
+        display: flex; align-items: center; gap: 4px;
+        flex: 1 1 0; min-width: 0; max-width: 40vw;
+        margin: 0 8px; overflow-x: auto; overflow-y: hidden;
+        scrollbar-width: thin;
+      }
+      #ytm-inpage-queue:empty { display: none; }
+      .ytm-ipq-item {
+        position: relative; flex: 0 0 auto; width: 64px; height: 36px;
+        border-radius: 4px; overflow: hidden; cursor: pointer;
+        background: rgba(0,0,0,.2);
+      }
+      .ytm-ipq-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
+      .ytm-ipq-item:hover { outline: 2px solid #f00; }
+      .ytm-ipq-remove {
+        position: absolute; top: 0; right: 0; width: 14px; height: 14px;
+        display: none; align-items: center; justify-content: center;
+        background: rgba(0,0,0,.75); color: #fff; font-size: 10px; line-height: 1;
+        border: none; padding: 0; cursor: pointer; border-radius: 0 0 0 4px;
+      }
+      .ytm-ipq-item:hover .ytm-ipq-remove { display: flex; }
+      .ytm-ipq-more {
+        flex: 0 0 auto; height: 36px; padding: 0 8px; border-radius: 4px;
+        border: none; cursor: pointer; font: 600 11px Roboto, Arial, sans-serif;
+        background: rgba(0,0,0,.6); color: #fff;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  // Local copy of the worker's comparator (IIFE — cannot import). 'suggested'
+  // has no per-video field here and falls back to addedAt, matching the
+  // worker's own fallback sorts.
+  function sortVideosList(videos, sortBy, direction) {
+    return [...videos].sort((a, b) => {
+      let va, vb;
+      switch (sortBy) {
+        case 'duration': va = a.duration || 0; vb = b.duration || 0; break;
+        case 'uploadedAt':
+          va = a.uploadedAt ? new Date(a.uploadedAt).getTime() : 0;
+          vb = b.uploadedAt ? new Date(b.uploadedAt).getTime() : 0; break;
+        default: va = a.addedAt || 0; vb = b.addedAt || 0;
+      }
+      return direction === 'asc' ? va - vb : vb - va;
+    });
+  }
+
+  // Create/remove the strip according to settings + masthead presence. No
+  // retry loop: the throttled mutation callback re-enters when the masthead
+  // appears or gets re-rendered (strip node disconnected).
+  function ensureInPageQueue() {
+    const existing = document.getElementById('ytm-inpage-queue');
+    if (!cachedSettings?.inPageQueue) {
+      if (existing) existing.remove();
+      return;
+    }
+    const host = document.querySelector('ytd-masthead #container');
+    if (!host) return;
+    if (existing && existing.isConnected && host.contains(existing)) return;
+    if (existing) existing.remove();
+
+    const strip = document.createElement('div');
+    strip.id = 'ytm-inpage-queue';
+
+    // Vertical wheel scrolls the strip horizontally
+    strip.addEventListener('wheel', (e) => {
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        e.preventDefault();
+        strip.scrollLeft += e.deltaY;
+      }
+    }, { passive: false });
+
+    // Event delegation — one listener set on the strip; tiles carry no closures
+    strip.addEventListener('click', (e) => {
+      const removeBtn = e.target.closest('.ytm-ipq-remove');
+      if (removeBtn) {
+        e.stopPropagation();
+        const tile = removeBtn.closest('.ytm-ipq-item');
+        // sessionId scopes the removal to what the strip displays — a same-id
+        // entry in ANOTHER session must survive (worker supports the scoping)
+        if (tile) safeSend({ type: 'REMOVE_VIDEO', videoId: tile.dataset.videoId, sessionId: ipqActiveSessionId });
+        return;
+      }
+      const tile = e.target.closest('.ytm-ipq-item');
+      if (tile) {
+        // URL built only from the stored 11-char video id — never from page data
+        safeSend({ type: 'OPEN_VIDEO', url: 'https://www.youtube.com/watch?v=' + tile.dataset.videoId });
+        return;
+      }
+      if (e.target.closest('.ytm-ipq-more')) {
+        // Worker resolves sender.tab.id (stage 01 fallback). If Chrome rejects
+        // the relayed gesture, the handler's error path makes this a silent
+        // no-op — acceptable degraded behavior.
+        safeSend({ type: 'OPEN_SIDE_PANEL' });
+      }
+    });
+    strip.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
+    strip.addEventListener('auxclick', (e) => {
+      if (e.button !== 1) return;
+      const tile = e.target.closest('.ytm-ipq-item');
+      if (tile) {
+        e.preventDefault();
+        safeSend({ type: 'OPEN_VIDEO_NEW_TAB', url: 'https://www.youtube.com/watch?v=' + tile.dataset.videoId });
+      }
+    });
+
+    const center = host.querySelector('#center');
+    if (center) center.insertAdjacentElement('afterend', strip);
+    else host.appendChild(strip);
+    renderInPageQueueFrom(lastKnownVideos);
+  }
+
+  async function refreshInPageQueue() {
+    try {
+      if (!isContextValid()) return;
+      const r = await chrome.storage.local.get(['yt_videos', 'yt_sessions']);
+      lastKnownVideos = r.yt_videos || [];
+      ipqActiveSessionId = r.yt_sessions?.activeId || 'main';
+      renderInPageQueueFrom(lastKnownVideos);
+    } catch {}
+  }
+
+  function renderInPageQueueFrom(videos) {
+    const strip = document.getElementById('ytm-inpage-queue');
+    if (!strip) return;
+    // Unwatched, non-Shorts, active session only; panel's persisted sort
+    const items = sortVideosList(
+      (videos || []).filter(v => !v.watched && !v.isShort &&
+        (v.sessionId || 'main') === ipqActiveSessionId),
+      cachedSettings?.sortBy || 'addedAt',
+      cachedSettings?.sortDirection || 'desc'
+    );
+    // textContent-only rebuild (≤31 nodes) — no innerHTML with video data
+    strip.textContent = '';
+    for (const v of items.slice(0, IPQ_MAX_TILES)) {
+      const tile = document.createElement('div');
+      tile.className = 'ytm-ipq-item';
+      tile.title = (v.title || 'Unknown') + (v.channel ? ' — ' + v.channel : '');
+      tile.dataset.videoId = v.id;
+      const img = document.createElement('img');
+      if (v.thumbnail) img.src = v.thumbnail;
+      img.alt = '';
+      img.loading = 'lazy';
+      img.draggable = false;
+      tile.appendChild(img);
+      const rm = document.createElement('button');
+      rm.className = 'ytm-ipq-remove';
+      rm.textContent = '✕';
+      rm.title = 'Remove from queue';
+      tile.appendChild(rm);
+      strip.appendChild(tile);
+    }
+    if (items.length > IPQ_MAX_TILES) {
+      const more = document.createElement('button');
+      more.className = 'ytm-ipq-more';
+      more.textContent = '+' + (items.length - IPQ_MAX_TILES);
+      more.title = 'Open the side panel to see the full queue';
+      strip.appendChild(more);
+    }
+  }
+
   // --- Ctrl+Middle-Click Detection (star tag) ---
 
   document.addEventListener('auxclick', (e) => {
@@ -1114,6 +1294,9 @@
       indicatorRefreshPending = false;
       if (!isContextValid()) return;
       applyThumbnailIndicators();
+      // Re-attach the queue strip after masthead re-renders (SPA nav, A/B
+      // swaps) — same throttle, no extra observers
+      ensureInPageQueue();
       if (cachedSettings?.hideRecs) applyHideRecs(true);
     }, 1500);
   }
@@ -1126,10 +1309,19 @@
       if (changes.yt_videos) {
         setQueuedIdsFrom(changes.yt_videos.newValue || []);
         scheduleIndicatorRefresh();
+        lastKnownVideos = changes.yt_videos.newValue || [];
+        renderInPageQueueFrom(lastKnownVideos);
       }
       if (changes.yt_settings) {
         cachedSettings = changes.yt_settings.newValue || {};
         applyYouTubeUI();
+        ensureInPageQueue();                    // strip toggled on/off
+        renderInPageQueueFrom(lastKnownVideos); // sort changes re-order tiles
+      }
+      if (changes.yt_sessions) {
+        // Active-session switch re-filters the strip (contract ruling 2)
+        ipqActiveSessionId = changes.yt_sessions.newValue?.activeId || 'main';
+        renderInPageQueueFrom(lastKnownVideos);
       }
     });
   } catch {}
@@ -1138,7 +1330,10 @@
 
   function init() {
     injectIndicatorStyles();
+    injectInPageQueueStyles();
     refreshQueuedIds().then(applyThumbnailIndicators);
+    // Settings first (ensureInPageQueue reads cachedSettings), then queue data
+    getSettings().then(() => { ensureInPageQueue(); refreshInPageQueue(); });
     startTracking();
     resetSeekHistory(getCurrentVideoId());
     bindVideoFeatures();

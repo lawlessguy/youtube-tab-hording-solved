@@ -27,8 +27,15 @@ async function loadSettings() {
     document.getElementById('speed-slider').value = Math.round(s.speedLevel * 10);
     document.getElementById('speed-value').textContent = fmtSpeed(s.speedLevel);
     document.getElementById('speed-scope').value = s.speedScope;
+    document.getElementById('inpage-queue-toggle').checked = !!s.inPageQueue;
   } catch {}
 }
+
+// --- In-Page Queue Strip toggle (stage 01) ---
+// Content scripts watch yt_settings via storage.onChanged — saving is enough
+document.getElementById('inpage-queue-toggle').addEventListener('change', e => {
+  msg({ type: 'UPDATE_SETTINGS', settings: { inPageQueue: e.target.checked } });
+});
 
 // --- Volume ---
 document.getElementById('volume-slider').addEventListener('input', e => {
@@ -86,6 +93,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (!ss.dataset.dragging && s.speedLevel !== undefined) {
     ss.value = Math.round(s.speedLevel * 10);
     document.getElementById('speed-value').textContent = fmtSpeed(s.speedLevel);
+  }
+  // Keep the strip checkbox honest while the panel/another surface toggles it
+  if (s.inPageQueue !== undefined) {
+    document.getElementById('inpage-queue-toggle').checked = !!s.inPageQueue;
   }
 });
 
