@@ -81,6 +81,10 @@ header {
   padding: 6px 0;
 }
 
+/* Toggle Bar: secondary row (feature stages append buttons; hidden while empty) */
+.toggle-bar--secondary { padding-top: 0; }
+.toggle-bar--secondary:empty { display: none; }
+
 .tb-btn {
   flex: 1;
   display: flex;

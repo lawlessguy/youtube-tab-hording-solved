@@ -1,4 +1,4 @@
-import { STORAGE_KEYS, DEFAULT_SETTINGS, MSG } from '../utils/constants.js';
+import { STORAGE_KEYS, DEFAULT_SETTINGS, DEFAULT_SESSIONS, MSG } from '../utils/constants.js';
 import * as storage from '../utils/storage.js';
 import {
   extractVideoId, isYouTubeUrl, isShortUrl, isYouTubeHost,
@@ -74,12 +74,32 @@ async function whitelistExtensionTab(tabId, ttlMs) {
 
 // --- Initialization ---
 
+// One-time normalization of legacy queue entries (contract: sessionId missing
+// ⇒ 'main', addCount missing ⇒ 1). Also initializes the array when absent.
+// Goes through storage.update — never raw set — per the mutex invariant.
+// Exposed on the worker global so headless tests can exercise the migration
+// without simulating a full extension reinstall.
+function normalizeLegacyVideos() {
+  return storage.update(STORAGE_KEYS.VIDEOS, (videos) => {
+    if (!videos) return [];
+    let changed = false;
+    const normalized = videos.map((v) => {
+      if (v.sessionId != null && v.addCount != null) return v;
+      changed = true;
+      return { ...v, sessionId: v.sessionId ?? 'main', addCount: v.addCount ?? 1 };
+    });
+    return changed ? normalized : undefined;
+  });
+}
+self.normalizeLegacyVideos = normalizeLegacyVideos;
+
 chrome.runtime.onInstalled.addListener(async () => {
   const settings = await storage.get(STORAGE_KEYS.SETTINGS);
   if (!settings) await storage.set(STORAGE_KEYS.SETTINGS, DEFAULT_SETTINGS);
 
-  const videos = await storage.get(STORAGE_KEYS.VIDEOS);
-  if (!videos) await storage.set(STORAGE_KEYS.VIDEOS, []);
+  await normalizeLegacyVideos();
+
+  await storage.update(STORAGE_KEYS.SESSIONS, (s) => (s ? undefined : DEFAULT_SESSIONS));
 
   const logged = await storage.get(STORAGE_KEYS.LOGGED_VIDEOS);
   if (!logged) await storage.set(STORAGE_KEYS.LOGGED_VIDEOS, []);

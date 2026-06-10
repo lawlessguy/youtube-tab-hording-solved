@@ -162,6 +162,56 @@ async function run() {
   check('Default volume is 100', settings?.volumeLevel === 100);
   check('Default speed is 1.0', settings?.speedLevel === 1.0);
 
+  // Contract defaults added by the scaffolding stage
+  check('Viewing-mode defaults present', settings?.inPageQueue === false && settings?.panelMode === 'full');
+  check('Player defaults present', settings?.playerResizeEnabled === true
+    && settings?.playerSizeDefault === null && settings?.playerSizeTheater === null);
+  check('PiP defaults present', settings?.pipAutoEnabled === false
+    && settings?.pipOpacity === 100 && settings?.pipSize === 'medium');
+  check('Analytics/shorts defaults present', settings?.activityLogEnabled === true
+    && settings?.shortsAutoScroll === false && settings?.shortsAutoClose === false);
+
+  // Sessions storage initialized by onInstalled
+  const sessions = await sw.evaluate(async () => {
+    const result = await chrome.storage.local.get('yt_sessions');
+    return result.yt_sessions;
+  });
+  check('Sessions initialized with activeId main', sessions?.activeId === 'main');
+  check('Main session entry exists', Array.isArray(sessions?.list)
+    && sessions.list.some(s => s.id === 'main' && s.name === 'Main'));
+
+  // Legacy queue normalization: seed an entry missing sessionId/addCount, then
+  // re-run the onInstalled migration via the worker-global helper (simulating
+  // a real extension reload headless would close the popup/panel pages)
+  const normalizedLegacy = await sw.evaluate(async () => {
+    const legacy = {
+      id: 'legacy00000', url: 'https://www.youtube.com/watch?v=legacy00000',
+      title: 'Legacy', addedAt: 1, watched: false,
+    };
+    const before = await chrome.storage.local.get('yt_videos');
+    await chrome.storage.local.set({ yt_videos: [...(before.yt_videos || []), legacy] });
+    await self.normalizeLegacyVideos();
+    const after = await chrome.storage.local.get('yt_videos');
+    const v = (after.yt_videos || []).find(x => x.id === 'legacy00000');
+    // Clean up so later tests still see an empty queue
+    await chrome.storage.local.set({
+      yt_videos: (after.yt_videos || []).filter(x => x.id !== 'legacy00000'),
+    });
+    return v;
+  });
+  check('Legacy video backfilled sessionId main', normalizedLegacy?.sessionId === 'main');
+  check('Legacy video backfilled addCount 1', normalizedLegacy?.addCount === 1);
+
+  // Secondary toggle-bar row scaffold: present in DOM, hidden while empty
+  const secondaryBar = await sidePanel.evaluate(() => {
+    const el = document.querySelector('.toggle-bar--secondary');
+    if (!el) return null;
+    return { empty: el.childElementCount === 0, display: getComputedStyle(el).display };
+  });
+  check('Secondary toggle-bar row present', !!secondaryBar);
+  check('Secondary toggle-bar hidden while empty',
+    secondaryBar?.empty === true && secondaryBar?.display === 'none');
+
   // --- Test 6: Volume boost on a controlled page ---
   console.log('\n--- Test 6: Volume Boost ---');
   const BOOST_PAGE = '<!DOCTYPE html><html><head><title>b</title></head><body><video></video></body></html>';
