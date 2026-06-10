@@ -52,6 +52,15 @@
     }
   }
 
+  // Once createMediaElementSource() has rerouted the video's audio, a
+  // suspended AudioContext silences it completely — even at volumes <=100%.
+  // resume() only succeeds after user activation, so retry opportunistically.
+  function resumeAudioContext() {
+    if (audioContext && audioContext.state === 'suspended') {
+      audioContext.resume().catch(() => {});
+    }
+  }
+
   function setVolume(percent) {
     const video = getVideoElement();
     if (!video) return;
@@ -63,6 +72,7 @@
       video.volume = percent / 100;
       if (gainNode) gainNode.gain.value = 1;
     }
+    resumeAudioContext();
   }
 
   // --- Speed Control ---
@@ -73,7 +83,7 @@
     video.playbackRate = speed;
   }
 
-  // --- Watch Progress (10% = marked watched) ---
+  // --- Watch Progress (20% = marked watched) ---
 
   function checkWatchProgress(video) {
     if (hasMarkedWatched) return;
@@ -133,6 +143,9 @@
       if (!isContextValid()) { clearInterval(trackingInterval); return; }
       const video = getVideoElement();
       if (video && !video.paused && !video.ended) {
+        // A playing video implies user activation — recover a boost context
+        // that was created before activation existed
+        resumeAudioContext();
         accumulatedSeconds++;
         checkWatchProgress(video);
       }
