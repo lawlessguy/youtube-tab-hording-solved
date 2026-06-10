@@ -71,9 +71,10 @@ document.getElementById('open-sidepanel').addEventListener('click', async () => 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab) {
-      // The worker disables the panel on non-YouTube tabs; clicking this
-      // button is an explicit request, so re-enable before opening
-      await chrome.sidePanel.setOptions({ tabId: tab.id, enabled: true });
+      // The worker disables the panel on non-YouTube tabs; re-enable before
+      // opening. MUST be fire-and-forget: awaiting it consumes the user
+      // gesture and open() then throws. The calls are processed in order.
+      chrome.sidePanel.setOptions({ tabId: tab.id, enabled: true }).catch(() => {});
       await chrome.sidePanel.open({ tabId: tab.id });
     }
   } catch {

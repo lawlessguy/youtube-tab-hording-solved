@@ -330,7 +330,7 @@
   // --- YouTube UI Modifications ---
 
   async function applyYouTubeUI() {
-    const settings = await getSettings();
+    const settings = await getSettings() || {};
     applyVideoInfoOverlay(settings.showVideoInfo);
     applyHideRecs(settings.hideRecs);
   }

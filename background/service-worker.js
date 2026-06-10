@@ -835,9 +835,11 @@ async function handleMessage(message, sender) {
 
     case MSG.OPEN_SIDE_PANEL: {
       if (message.tabId) {
-        // Opening from the popup is an explicit request — re-enable first in
-        // case this tab was disabled as a non-YouTube tab
-        await chrome.sidePanel.setOptions({ tabId: message.tabId, enabled: true });
+        // Re-enable in case this tab was disabled as non-YouTube. MUST be
+        // fire-and-forget: this handler runs synchronously off the message
+        // event and open() needs the caller's user gesture — any await
+        // before it consumes the gesture and open() throws.
+        chrome.sidePanel.setOptions({ tabId: message.tabId, enabled: true }).catch(() => {});
         await chrome.sidePanel.open({ tabId: message.tabId });
       }
       return { success: true };
