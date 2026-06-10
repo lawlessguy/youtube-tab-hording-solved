@@ -50,9 +50,18 @@ async function run() {
   const extensionId = sw.url().split('/')[2];
   console.log('Extension ID:', extensionId);
 
+  // Console errors are collected from page creation onward (registering the
+  // listeners after the interactions missed everything that mattered)
+  const errors = [];
+  function watchConsole(page, label) {
+    page.on('console', m => { if (m.type() === 'error') errors.push('[' + label + '] ' + m.text()); });
+    page.on('pageerror', e => errors.push('[' + label + '] ' + e.message));
+  }
+
   // --- Test 1: Popup ---
   console.log('\n--- Test 1: Popup UI ---');
   const popup = await context.newPage();
+  watchConsole(popup, 'popup');
   await popup.goto(`chrome-extension://${extensionId}/popup/popup.html`);
   await popup.setViewportSize({ width: 400, height: 600 });
   await popup.waitForTimeout(1000);
@@ -71,6 +80,7 @@ async function run() {
   // --- Test 2: Side Panel ---
   console.log('\n--- Test 2: Side Panel UI ---');
   const sidePanel = await context.newPage();
+  watchConsole(sidePanel, 'sidepanel');
   await sidePanel.goto(`chrome-extension://${extensionId}/sidepanel/sidepanel.html`);
   await sidePanel.setViewportSize({ width: 350, height: 900 });
   await sidePanel.waitForTimeout(1000);
@@ -152,11 +162,35 @@ async function run() {
   check('Default volume is 100', settings?.volumeLevel === 100);
   check('Default speed is 1.0', settings?.speedLevel === 1.0);
 
-  // --- Test 6: Console Errors ---
-  console.log('\n--- Test 6: Console Errors ---');
-  const errors = [];
-  popup.on('console', m => { if (m.type() === 'error') errors.push('[popup] ' + m.text()); });
-  sidePanel.on('console', m => { if (m.type() === 'error') errors.push('[sidepanel] ' + m.text()); });
+  // --- Test 6: Volume boost on a controlled page ---
+  console.log('\n--- Test 6: Volume Boost ---');
+  const BOOST_PAGE = '<!DOCTYPE html><html><head><title>b</title></head><body><video></video></body></html>';
+  await context.route('https://www.youtube.com/__boost_test__', route =>
+    route.fulfill({ status: 200, contentType: 'text/html', body: BOOST_PAGE }));
+  const boostPage = await context.newPage();
+  watchConsole(boostPage, 'boost');
+  await boostPage.goto('https://www.youtube.com/__boost_test__');
+  await boostPage.waitForTimeout(1500); // content script init
+
+  const boostTabId = await sw.evaluate(async () => {
+    const tabs = await chrome.tabs.query({ url: 'https://www.youtube.com/__boost_test__' });
+    return tabs[0]?.id;
+  });
+  await sw.evaluate(tabId =>
+    chrome.tabs.sendMessage(tabId, { type: 'SET_VOLUME', value: 300 }), boostTabId);
+  await boostPage.waitForTimeout(300);
+  const boostVol = await boostPage.evaluate(() => document.querySelector('video').volume);
+  check('Boost >100% pins element volume to 1 (got ' + boostVol + ')', boostVol === 1);
+
+  await sw.evaluate(tabId =>
+    chrome.tabs.sendMessage(tabId, { type: 'SET_VOLUME', value: 50 }), boostTabId);
+  await boostPage.waitForTimeout(300);
+  const halfVol = await boostPage.evaluate(() => document.querySelector('video').volume);
+  check('Volume 50% applies after boost (got ' + halfVol + ')', halfVol === 0.5);
+  await boostPage.close();
+
+  // --- Test 7: Console Errors (collected since page creation) ---
+  console.log('\n--- Test 7: Console Errors ---');
   await popup.waitForTimeout(500);
 
   if (errors.length > 0) {
