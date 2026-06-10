@@ -7,8 +7,10 @@
  */
 const { chromium } = require('playwright');
 const path = require('path');
+const fs = require('fs');
 
 const extensionPath = path.resolve(__dirname, '..');
+const stageShotDir = path.join(extensionPath, 'screenshots', 'stages', 'indicators');
 
 let passed = 0;
 let failed = 0;
@@ -44,6 +46,7 @@ function check(label, condition, detail) {
     <div style="position:relative"><a id="thumbnail" href="/watch?v=BADGETEST01"><img alt=""></a></div>
     <div style="position:relative"><a id="thumbnail" href="/watch?v=BADGETEST02"><img alt=""></a></div>
     <div style="position:relative"><a id="thumbnail" href="/watch?v=BADGETEST03"><img alt=""></a></div>
+    <div style="position:relative" id="shorts-shelf"><a class="shortsLockupViewModelFake" href="/shorts/BADGETEST04"><img alt=""></a></div>
   </body></html>`;
   await context.route('https://www.youtube.com/__badge_test__', route =>
     route.fulfill({ status: 200, contentType: 'text/html', body: FAKE_PAGE }));
@@ -71,6 +74,10 @@ function check(label, condition, detail) {
         title: 'w', channel: 'T', thumbnail: '', duration: 1, addedAt: 1,
         uploadedAt: null, isShort: false, category: 'Uncategorized',
         watched: true, starred: false },
+      { id: 'BADGETEST04', url: 'https://www.youtube.com/shorts/BADGETEST04',
+        title: 's', channel: 'T', thumbnail: '', duration: 1, addedAt: 1,
+        uploadedAt: null, isShort: true, category: 'Uncategorized',
+        watched: false, starred: false },
     ],
   }));
   await ytPage.waitForTimeout(3000); // onChanged + 1.5s throttle + slack
@@ -78,11 +85,22 @@ function check(label, condition, detail) {
   const after = await ytPage.evaluate(() => ({
     queued: document.querySelectorAll('.ytm-status-badge--queued').length,
     watched: document.querySelectorAll('.ytm-status-badge--watched').length,
+    shortsShelfBadge: !!document.querySelector('#shorts-shelf .ytm-status-badge--queued'),
+    queuedTitle: document.querySelector('.ytm-status-badge--queued')?.title || '',
+    watchedTitle: document.querySelector('.ytm-status-badge--watched')?.title || '',
   }));
-  check('Queued badge appeared via storage.onChanged (got ' + after.queued + ')',
-    after.queued === 1);
+  check('Queued badges appeared via storage.onChanged (got ' + after.queued + ')',
+    after.queued === 2);
   check('Watched badge appeared via storage.onChanged (got ' + after.watched + ')',
     after.watched === 1);
+  check('Shorts-lockup anchor got a badge (new selector)', after.shortsShelfBadge);
+  check('Queued badge has a tooltip (got "' + after.queuedTitle + '")',
+    after.queuedTitle.length > 0);
+  check('Watched badge has a tooltip (got "' + after.watchedTitle + '")',
+    after.watchedTitle.length > 0);
+
+  if (!fs.existsSync(stageShotDir)) fs.mkdirSync(stageShotDir, { recursive: true });
+  await ytPage.screenshot({ path: path.join(stageShotDir, 'fake-page-qw-badges.png') });
 
   // Un-queue everything — badges must disappear
   await sw.evaluate(() => chrome.storage.local.set({ yt_videos: [] }));

@@ -612,10 +612,15 @@
   }
 
   function applyThumbnailIndicators() {
-    // Find all video thumbnail anchors — supports both old and new YouTube layouts
+    // Find all video thumbnail anchors — supports old, new, and shorts-shelf
+    // YouTube layouts. Class-substring matching here is DOM targeting against
+    // YouTube's own markup, not URL validation — videoIds still come only
+    // from extractVideoIdFromHref.
     const anchors = document.querySelectorAll(
-      'a.yt-lockup-view-model__content-image, ' + // new layout (2024+)
-      'a#thumbnail[href]'                          // old layout
+      'a.yt-lockup-view-model__content-image, ' + // lockup layout (2024)
+      'a.ytLockupViewModelContentImage, '       + // lockup layout (2026, camelCase rename)
+      'a#thumbnail[href], '                       + // old layout
+      'a[class*="shortsLockup"][href]'              // shorts shelves (2025 layout)
     );
     for (const link of anchors) {
       const videoId = extractVideoIdFromHref(link.getAttribute('href'));
@@ -636,16 +641,21 @@
       if (isQueued || isWatched) {
         const wantClass = isQueued ? 'ytm-status-badge--queued' : 'ytm-status-badge--watched';
         const wantText = isQueued ? 'Q' : 'W';
+        const wantTitle = isQueued
+          ? 'In queue (YouTube Tab Manager)'
+          : 'Watched (YouTube Tab Manager)';
         if (existing) {
           // Update if state changed (e.g. queued → watched)
           if (!existing.classList.contains(wantClass)) {
             existing.className = 'ytm-status-badge ' + wantClass;
             existing.textContent = wantText;
+            existing.title = wantTitle;
           }
         } else {
           const badge = document.createElement('span');
           badge.className = 'ytm-status-badge ' + wantClass;
           badge.textContent = wantText;
+          badge.title = wantTitle;
           container.appendChild(badge);
         }
       } else {

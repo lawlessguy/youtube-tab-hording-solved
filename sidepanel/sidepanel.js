@@ -9,6 +9,9 @@ let starFilterActive = false;
 let nowPlayingVideoId = null;
 let lastMediaState = null;
 let cachedVideos = [];
+// videoIds currently open in any Chrome tab — worker-maintained, read from
+// chrome.storage.session (worker is the sole writer; see loadOpenTabIds)
+let openTabIds = new Set();
 
 // Virtual scroll data — full sorted arrays (not rendered to DOM)
 let dataVideos = [];
@@ -91,6 +94,18 @@ async function loadWatchTime() {
     document.getElementById('watch-week').textContent = fmt(wt.week);
     document.getElementById('watch-month').textContent = fmt(wt.month);
     document.getElementById('watch-year').textContent = fmt(wt.year);
+  } catch {}
+}
+
+// --- Open Tab Indicator State ---
+// Written by the worker to chrome.storage.SESSION (key inlined: plain
+// script). The panel is a trusted extension context, so it can read it.
+async function loadOpenTabIds() {
+  try {
+    const r = await chrome.storage.session.get('yt_open_tab_ids');
+    openTabIds = new Set(r.yt_open_tab_ids || []);
+    lastRenderKeys.clear();
+    renderVisibleCards();
   } catch {}
 }
 
@@ -282,6 +297,24 @@ function buildVideoItem(v, _unused, isWatched) {
   thumbImg.addEventListener('error', () => { thumbImg.style.background = '#333'; });
   const thumbWrap = el('div', { class: 'thumb-wrap' }, [thumbImg]);
   if (v.duration) thumbWrap.appendChild(el('span', { class: 'thumb-duration', text: dur(v.duration) }));
+
+  // Open-as-tab indicator (top-left) -- passive, pointer-events: none in CSS.
+  // Intentionally absent from the Now Playing card (it is by definition open).
+  if (openTabIds.has(v.id)) {
+    thumbWrap.appendChild(el('span', {
+      class: 'thumb-tab-badge', text: 'TAB', title: 'Open in a Chrome tab',
+    }));
+  }
+  // Add/move count chip (top-right) -- hidden while < 2 (every video was
+  // added once); legacy videos without the field count as 1
+  const addCount = v.addCount || 1;
+  if (addCount >= 2) {
+    thumbWrap.appendChild(el('span', {
+      class: 'thumb-addcount',
+      text: (addCount > 9 ? '9+' : addCount) + '\u00D7',
+      title: 'Added or moved to top ' + addCount + ' times',
+    }));
+  }
 
   const playBtn = el('button', { class: 'card-play-btn', text: '\u25B6' });
   playBtn.addEventListener('click', e => { e.stopPropagation(); openVideo(v.url); });
@@ -734,9 +767,15 @@ function scheduleLoadVideos() {
 }
 chrome.runtime.onMessage.addListener(m => { if (m.type === 'VIDEOS_UPDATED') scheduleLoadVideos(); });
 
-// Watch time updates arrive via storage instead of a 5s poll
+// Watch time updates arrive via storage instead of a 5s poll; the open-tab
+// set arrives the same way from the SESSION area (worker is its sole writer)
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.yt_watch_time) loadWatchTime();
+  if (area === 'session' && changes.yt_open_tab_ids) {
+    openTabIds = new Set(changes.yt_open_tab_ids.newValue || []);
+    lastRenderKeys.clear();   // virtual scroll skips unchanged range keys
+    renderVisibleCards();     // drag-safe: dragInProgress defers internally
+  }
 });
 
 // --- Virtual Scroll Listener ---
@@ -753,6 +792,7 @@ document.querySelector('.scroll-area').addEventListener('scroll', () => {
 
 // --- Init ---
 loadWatchTime();
+loadOpenTabIds();
 loadSettings();
 loadVideos();
 updateNowPlaying();

@@ -133,6 +133,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 // --- Tab Interception ---
 
 chrome.tabs.onCreated.addListener(async (tab) => {
+  scheduleOpenTabRecompute();
   await loadSessionState();
   recentlyCreatedTabs.set(tab.id, Date.now());
   persistSessionState();
@@ -140,6 +141,10 @@ chrome.tabs.onCreated.addListener(async (tab) => {
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (!changeInfo.url) return;
+
+  // Only URL commits can change the open-tab videoId set (anti-churn: title/
+  // favicon/audible onUpdated events return above and never trigger this)
+  scheduleOpenTabRecompute();
 
   // Keep side panel enablement in sync when a tab navigates in place
   updateSidePanelForTab(tabId, changeInfo.url);
@@ -186,12 +191,56 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  scheduleOpenTabRecompute();
   await loadSessionState();
   recentlyCreatedTabs.delete(tabId);
   extensionOpenedTabs.delete(tabId);
   persistSessionState();
   if (lastPlayingTabId === tabId) lastPlayingTabId = null;
 });
+
+// Prerender/instant swaps change tabIds without an onUpdated URL commit
+chrome.tabs.onReplaced.addListener(() => scheduleOpenTabRecompute());
+
+// --- Open Tab Tracking (yt_open_tab_ids in chrome.storage.session) ---
+// Event-driven: recomputed from tabs.query on tab create/navigate/remove/
+// replace and once per worker wake (top-level call at the bottom of this
+// file). Debounce coalesces bursts (window close = N onRemoved events → one
+// write). Written ONLY when the set actually differs from what is stored —
+// panel listens via storage.onChanged(area === 'session') so spurious writes
+// would churn it. Deliberately OUTSIDE the storage.update mutex: that mutex
+// serializes chrome.storage.LOCAL only, the worker is the single writer of
+// this session key, and the value is derived (recompute always overwrites
+// with ground truth) — do not route this through storage.update.
+
+let openTabRecomputeTimer = null;
+let lastOpenTabIdsJson = null; // null = unknown (fresh worker) — read before diffing
+
+function scheduleOpenTabRecompute() {
+  if (openTabRecomputeTimer) return;
+  openTabRecomputeTimer = setTimeout(() => {
+    openTabRecomputeTimer = null;
+    recomputeOpenTabIds().catch(() => {});
+  }, 250);
+}
+
+async function recomputeOpenTabIds() {
+  const tabs = await chrome.tabs.query({});
+  const ids = [...new Set(
+    tabs.map(t => extractVideoId(t.url || t.pendingUrl || '')).filter(Boolean)
+  )].sort();
+  const json = JSON.stringify(ids);
+  if (lastOpenTabIdsJson === null) {
+    try {
+      const cur = await chrome.storage.session.get(STORAGE_KEYS.OPEN_TAB_IDS);
+      lastOpenTabIdsJson = JSON.stringify(cur[STORAGE_KEYS.OPEN_TAB_IDS] ?? null);
+    } catch {}
+  }
+  if (json !== lastOpenTabIdsJson) {
+    lastOpenTabIdsJson = json;
+    await chrome.storage.session.set({ [STORAGE_KEYS.OPEN_TAB_IDS]: ids });
+  }
+}
 
 // --- Silent Background Logging ---
 
@@ -217,7 +266,10 @@ async function logVideoSilently(url, videoId, starred) {
 
 // --- Video Queue ---
 
-async function addVideoToQueue(url, videoId, explicitTimestamp, starred) {
+// opts is the reconciled extension point (integration contract §4): this
+// stage adds { bumpCount = true }; later stages add { source, sessionId }
+async function addVideoToQueue(url, videoId, explicitTimestamp, starred, opts = {}) {
+  const { bumpCount = true } = opts;
   videoId = videoId || extractVideoId(url);
   if (!videoId) return null;
 
@@ -229,6 +281,10 @@ async function addVideoToQueue(url, videoId, explicitTimestamp, starred) {
     const existing = videos.find(v => v.id === videoId);
     if (existing) {
       existing.addedAt = explicitTimestamp || Date.now();
+      // addCount = "times added or moved to top" — re-add/re-open/intercept
+      // bumps; COLLECT_TABS sweeps pass bumpCount:false (a periodic sweep of
+      // everything open must not inflate counts); drag-to-top never calls this
+      if (bumpCount) existing.addCount = (existing.addCount || 1) + 1;
       if (starred) existing.starred = true;
       return videos;
     }
@@ -244,6 +300,7 @@ async function addVideoToQueue(url, videoId, explicitTimestamp, starred) {
       isShort: isShortUrl(url),
       watched: false,
       starred: !!starred,
+      addCount: 1,
     };
     videos.push(inserted);
     return videos;
@@ -474,7 +531,7 @@ async function handleMessage(message, sender) {
         const videoId = extractVideoId(tab.url);
         if (videoId) {
           const timestamp = baseTime + (ytTabs.length - i);
-          const video = await addVideoToQueue(tab.url, videoId, timestamp);
+          const video = await addVideoToQueue(tab.url, videoId, timestamp, undefined, { bumpCount: false });
           if (video) added++;
         }
       }
@@ -487,7 +544,7 @@ async function handleMessage(message, sender) {
         return [];
       });
       for (const entry of drained) {
-        const video = await addVideoToQueue(entry.url, entry.id, entry.timestamp, entry.starred);
+        const video = await addVideoToQueue(entry.url, entry.id, entry.timestamp, entry.starred, { bumpCount: false });
         if (video) added++;
       }
 
@@ -879,3 +936,7 @@ async function handleMessage(message, sender) {
       return { error: 'Unknown message type: ' + message.type };
   }
 }
+
+// Module top level runs on every worker wake — self-healing open-tab set
+// after MV3 worker death (no polling: tab events themselves wake the worker)
+scheduleOpenTabRecompute();
