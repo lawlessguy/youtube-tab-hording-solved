@@ -701,6 +701,23 @@ async function handleMessage(message, sender) {
       return { success: true };
     }
 
+    case MSG.SPEED_CHANGED: {
+      // Native YouTube rate change reported by the content script. Persist
+      // only — deliberately NO applyMediaControl(): the change stays in its
+      // tab, sliders everywhere update via storage.onChanged, and other tabs
+      // adopt the value at their next loadeddata auto-apply. Skipping the
+      // write when the value is unchanged makes an echo loop structurally
+      // impossible (second guard alongside the content script's
+      // lastAppliedRate check).
+      const v = Math.min(10, Math.max(0.1, Number(message.value) || 1));
+      await storage.update(STORAGE_KEYS.SETTINGS, (s = { ...DEFAULT_SETTINGS }) => {
+        if (Math.abs((s.speedLevel ?? 1) - v) < 0.001) return undefined; // skip write — no echo
+        s.speedLevel = v;
+        return s;
+      });
+      return { success: true, value: v };
+    }
+
     case MSG.GET_SETTINGS:
       return await storage.get(STORAGE_KEYS.SETTINGS) || DEFAULT_SETTINGS;
 

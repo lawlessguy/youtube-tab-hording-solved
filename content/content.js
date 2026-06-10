@@ -12,6 +12,25 @@
   // accumulating across flushes); reset only on SPA navigation/video change.
   let trackedVideoId = null, trackedUrl = null, trackedTitle = null,
       trackedChannel = null, trackedDurationSec = 0, trackedMaxPercent = 0;
+  // Speed sync (stage 02): lastAppliedRate suppresses our own SET_SPEED
+  // echoes; rate-sync only arms 500ms after the first 'playing' of each video
+  // (YouTube applies its own remembered session speed during load, which must
+  // not be reported as user intent). Reset on SPA video change.
+  let lastAppliedRate = null;
+  let rateSyncArmedAt = 0;
+  let rateReportTimer = null;
+  // Timeline seek history (stage 02) — in-memory per-video undo/redo stacks,
+  // deliberately not persisted (cleared on video change)
+  const SEEK_MIN_JUMP = 3;       // seconds — below this a seek isn't recorded
+  const SEEK_COALESCE_MS = 800;  // quiet period that ends a scrub burst
+  const SEEK_STACK_MAX = 50;
+  let seekUndo = [];
+  let seekRedo = [];
+  let seekPrevTime = null;       // last known position while NOT seeking
+  let seekOrigin = null;         // pre-seek position of the current burst
+  let seekFinalizeTimer = null;
+  let suppressSeekRecording = false; // our own undo/redo seeks aren't recorded
+  let seekHistoryVideoId = null;
 
   // Check if the extension context is still valid (becomes invalid after reload/update)
   function isContextValid() {
@@ -85,8 +104,124 @@
   function setSpeed(speed) {
     const video = getVideoElement();
     if (!video) return;
-    video.playbackRate = speed;
+    lastAppliedRate = speed; // recorded BEFORE assigning: the ratechange this
+    video.playbackRate = speed; // triggers must never be re-reported as native
   }
+
+  // --- Speed Sync (native YouTube speed menu → yt_settings.speedLevel) ---
+
+  function bindRateSync(video) {
+    if (video._ytmRateBound) return;
+    video._ytmRateBound = true;
+    video.addEventListener('playing', () => {
+      if (!rateSyncArmedAt) rateSyncArmedAt = Date.now() + 500;
+    });
+    video.addEventListener('ratechange', () => {
+      if (!rateSyncArmedAt || Date.now() < rateSyncArmedAt) return; // load-time machine changes
+      if (document.querySelector('.html5-video-player.ad-showing')) return; // ads run at their own rate
+      if (lastAppliedRate !== null && Math.abs(video.playbackRate - lastAppliedRate) < 0.001) return; // our own SET_SPEED echo
+      if (rateReportTimer) clearTimeout(rateReportTimer);
+      rateReportTimer = setTimeout(() => {
+        rateReportTimer = null;
+        const v = getVideoElement();
+        if (!v) return;
+        if (document.querySelector('.html5-video-player.ad-showing')) return;
+        lastAppliedRate = v.playbackRate; // repeated identical events stay quiet
+        safeSend({ type: 'SPEED_CHANGED', value: v.playbackRate });
+      }, 250);
+    });
+  }
+
+  // --- Timeline Seek History (Ctrl-Z / Ctrl-Shift-Z / Ctrl-Y) ---
+
+  function bindSeekHistory(video) {
+    if (video._ytmSeekBound) return;
+    video._ytmSeekBound = true;
+    // timeupdate fires ~4Hz — cheap enough to track the pre-seek position
+    // continuously without extra throttling
+    video.addEventListener('timeupdate', () => {
+      if (window.location.pathname !== '/watch') return;
+      if (!video.seeking && !suppressSeekRecording) seekPrevTime = video.currentTime;
+    });
+    video.addEventListener('seeking', () => {
+      if (window.location.pathname !== '/watch') return;
+      if (suppressSeekRecording) return;
+      // First seek of a burst captures the origin; scrub bursts keep it
+      if (seekOrigin === null) seekOrigin = seekPrevTime !== null ? seekPrevTime : 0;
+    });
+    video.addEventListener('seeked', () => {
+      if (window.location.pathname !== '/watch') return;
+      if (suppressSeekRecording) { suppressSeekRecording = false; return; }
+      if (seekFinalizeTimer) clearTimeout(seekFinalizeTimer);
+      seekFinalizeTimer = setTimeout(finalizeSeek, SEEK_COALESCE_MS);
+    });
+  }
+
+  function finalizeSeek() {
+    seekFinalizeTimer = null;
+    const v = getVideoElement();
+    if (seekOrigin !== null && v && Math.abs(v.currentTime - seekOrigin) >= SEEK_MIN_JUMP) {
+      seekUndo.push(seekOrigin);
+      if (seekUndo.length > SEEK_STACK_MAX) seekUndo.splice(0, seekUndo.length - SEEK_STACK_MAX);
+      seekRedo.length = 0; // a new user seek invalidates the redo branch
+    }
+    seekOrigin = null;
+  }
+
+  function resetSeekHistory(videoId) {
+    seekUndo = [];
+    seekRedo = [];
+    seekOrigin = null;
+    seekPrevTime = null;
+    suppressSeekRecording = false;
+    if (seekFinalizeTimer) { clearTimeout(seekFinalizeTimer); seekFinalizeTimer = null; }
+    seekHistoryVideoId = videoId !== undefined ? videoId : null;
+  }
+
+  let seekToastTimer = null;
+  function showSeekToast(seconds, isRedo) {
+    const s = Math.max(0, Math.floor(seconds));
+    const label = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+    const host = document.getElementById('movie_player') || document.body;
+    let toast = document.getElementById('ytm-seek-toast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'ytm-seek-toast';
+      toast.style.cssText = 'position:absolute;top:12px;left:12px;' +
+        'background:rgba(0,0,0,0.75);color:#fff;font-size:13px;padding:4px 10px;' +
+        'border-radius:4px;z-index:9999;pointer-events:none;' +
+        'font-family:Roboto,Arial,sans-serif;';
+    }
+    if (toast.parentElement !== host) host.appendChild(toast);
+    toast.textContent = (isRedo ? '↷' : '↶') + ' ' + label; // textContent only
+    toast.style.display = '';
+    if (seekToastTimer) clearTimeout(seekToastTimer);
+    seekToastTimer = setTimeout(() => { toast.style.display = 'none'; }, 900);
+  }
+
+  // Capture phase beats YouTube's own key handlers; the editable guard
+  // preserves text undo in the comment box / search field, and empty stacks
+  // pass the key through untouched.
+  document.addEventListener('keydown', (e) => {
+    if (!e.ctrlKey || e.altKey || e.metaKey) return;
+    const k = (e.key || '').toLowerCase();
+    if (k !== 'z' && k !== 'y') return;
+    if (window.location.pathname !== '/watch') return;
+    if (e.target && e.target.closest &&
+        e.target.closest('input, textarea, select, [contenteditable], #contenteditable-root')) return;
+    const video = getVideoElement();
+    if (!video) return;
+    const redo = k === 'y' || (k === 'z' && e.shiftKey);
+    const stack = redo ? seekRedo : seekUndo;
+    if (!stack.length) return; // empty: let the key fall through
+    e.preventDefault();
+    e.stopPropagation();
+    const target = stack.pop();
+    (redo ? seekUndo : seekRedo).push(video.currentTime);
+    suppressSeekRecording = true;
+    video.currentTime = target;
+    showSeekToast(target, redo);
+  }, true);
 
   // --- Watch Progress (20% = marked watched) ---
 
@@ -212,6 +347,8 @@
     }
     setupEndedListener();
     setupAutoApply();
+    bindRateSync(video);
+    bindSeekHistory(video);
     applyStoredSettings();
   }
 
@@ -372,6 +509,9 @@
     const settings = await getSettings() || {};
     applyVideoInfoOverlay(settings.showVideoInfo);
     applyHideRecs(settings.hideRecs);
+    // AFTER applyHideRecs: the resize style must follow the hideRecs style in
+    // <head> so its doubled-id selectors win (contract ruling 8)
+    applyPlayerSize();
   }
 
   function applyVideoInfoOverlay(enabled) {
@@ -592,6 +732,251 @@
     originalCommentsNextSibling = null;
   }
 
+  // --- Resizable Player (stage 02) ---
+  // Drag handles on the watch-page player; sizes persist per-mode in
+  // yt_settings (playerSizeDefault / playerSizeTheater). The size CSS uses
+  // doubled-id selectors + last-in-head ordering so it deterministically
+  // beats the hideRecs full-width rules (contract ruling 8).
+
+  const RESIZE_MIN_W = 480;
+  const RESIZE_MIN_H = 270;
+  let resizeFlexyObserver = null;
+  let resizeHandleTimer = null;
+  let resizeOverride = null; // in-flight drag size — beats stored settings
+  let resizeDrag = null;
+
+  function getPlayerMode() {
+    if (document.fullscreenElement ||
+        document.querySelector('ytd-watch-flexy[fullscreen]')) return 'fullscreen';
+    if (document.querySelector('ytd-watch-flexy[theater]')) return 'theater';
+    return 'default';
+  }
+
+  function getResizeContainer(mode) {
+    if (mode === 'theater') return document.querySelector('#full-bleed-container');
+    return document.querySelector('#player-container.ytd-watch-flexy, #player-container');
+  }
+
+  function buildResizeCss() {
+    const s = cachedSettings || {};
+    let def = s.playerSizeDefault || null;
+    let the = s.playerSizeTheater || null;
+    if (resizeOverride) {
+      if (resizeOverride.mode === 'theater') the = { h: resizeOverride.h };
+      else def = { w: resizeOverride.w, h: resizeOverride.h };
+    }
+    // Clamp to the CURRENT viewport at apply time, never persisting the
+    // clamp — a stored size from a bigger monitor must come back intact
+    const maxW = Math.max(RESIZE_MIN_W, window.innerWidth - 24);
+    const maxH = Math.max(RESIZE_MIN_H, window.innerHeight - 120);
+    const rules = [];
+    if (def && def.w != null) {
+      const w = Math.round(Math.min(Math.max(def.w, RESIZE_MIN_W), maxW));
+      rules.push('ytd-watch-flexy:not([theater]):not([fullscreen]) #player-container-outer#player-container-outer{max-width:' + w + 'px !important;}');
+    }
+    if (def && def.h != null) {
+      const h = Math.round(Math.min(Math.max(def.h, RESIZE_MIN_H), maxH));
+      rules.push('ytd-watch-flexy:not([theater]):not([fullscreen]) #player-container-inner#player-container-inner{height:' + h + 'px !important;padding-top:0 !important;}');
+    }
+    if (the && the.h != null) {
+      const h = Math.round(Math.min(Math.max(the.h, RESIZE_MIN_H), maxH));
+      rules.push('ytd-watch-flexy[theater]:not([fullscreen]) #full-bleed-container#full-bleed-container{height:' + h + 'px !important;max-height:none !important;min-height:0 !important;}');
+    }
+    return rules.join('\n');
+  }
+
+  function writeResizeStyle() {
+    const css = buildResizeCss();
+    let styleEl = document.getElementById('ytm-resize-style');
+    if (!css) {
+      if (styleEl) {
+        styleEl.remove();
+        window.dispatchEvent(new Event('resize')); // YouTube re-fits the video
+      }
+      return;
+    }
+    if (!styleEl) {
+      styleEl = document.createElement('style');
+      styleEl.id = 'ytm-resize-style';
+    }
+    const changed = styleEl.textContent !== css;
+    if (changed) styleEl.textContent = css;
+    // Re-append on every write so the element stays AFTER the hideRecs style
+    const moved = styleEl.parentNode !== document.head ||
+      document.head.lastElementChild !== styleEl;
+    if (moved) document.head.appendChild(styleEl);
+    if (changed || moved) window.dispatchEvent(new Event('resize'));
+  }
+
+  function removeResizeArtifacts() {
+    if (resizeHandleTimer) { clearTimeout(resizeHandleTimer); resizeHandleTimer = null; }
+    const handles = document.getElementById('ytm-resize-handles');
+    if (handles) handles.remove();
+    const styleEl = document.getElementById('ytm-resize-style');
+    if (styleEl) {
+      styleEl.remove();
+      window.dispatchEvent(new Event('resize'));
+    }
+    // #ytm-resize-ui-style stays — it is inert without handles
+  }
+
+  function injectResizeUiStyle() {
+    if (document.getElementById('ytm-resize-ui-style')) return;
+    const style = document.createElement('style');
+    style.id = 'ytm-resize-ui-style';
+    style.textContent = `
+      #ytm-resize-handles {
+        position: absolute; inset: 0;
+        pointer-events: none; z-index: 78;
+      }
+      .ytm-resize-handle {
+        position: absolute; pointer-events: auto;
+      }
+      .ytm-resize-handle--e { top: 0; bottom: 0; right: -8px; width: 8px; cursor: ew-resize; }
+      .ytm-resize-handle--s { left: 0; right: 0; bottom: -8px; height: 8px; cursor: ns-resize; }
+      .ytm-resize-handle--se { right: -8px; bottom: -8px; width: 14px; height: 14px; cursor: nwse-resize; }
+      .ytm-resize-handle:hover,
+      #ytm-resize-handles.ytm-resizing .ytm-resize-handle {
+        background: rgba(255, 0, 0, 0.35); border-radius: 3px;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  // Theater/fullscreen flips arrive as attribute changes on ytd-watch-flexy
+  // (event-driven — no polling). Re-attached after SPA navigation.
+  function ensureFlexyObserver() {
+    if (resizeFlexyObserver) return;
+    const flexy = document.querySelector('ytd-watch-flexy');
+    if (!flexy) return;
+    resizeFlexyObserver = new MutationObserver(() => applyPlayerSize());
+    resizeFlexyObserver.observe(flexy, {
+      attributes: true, attributeFilter: ['theater', 'fullscreen', 'role'],
+    });
+  }
+
+  document.addEventListener('fullscreenchange', () => applyPlayerSize());
+
+  // Single entry point — called from applyYouTubeUI (init/SPA/onChanged), the
+  // flexy attribute observer, and fullscreenchange.
+  function applyPlayerSize(attempt = 0) {
+    if (resizeHandleTimer) { clearTimeout(resizeHandleTimer); resizeHandleTimer = null; }
+    const mode = getPlayerMode();
+    if (window.location.pathname !== '/watch' ||
+        (cachedSettings && cachedSettings.playerResizeEnabled === false) ||
+        mode === 'fullscreen') {
+      removeResizeArtifacts();
+      return;
+    }
+    writeResizeStyle();
+    ensureFlexyObserver();
+    const container = getResizeContainer(mode);
+    if (!container) {
+      // Capped retries like bindVideoFeatures; SPA navigation restarts them
+      if (attempt < 15) {
+        resizeHandleTimer = setTimeout(() => applyPlayerSize(attempt + 1), 1000);
+      }
+      return;
+    }
+    buildResizeHandles(container, mode);
+  }
+
+  function buildResizeHandles(container, mode) {
+    injectResizeUiStyle();
+    let overlay = document.getElementById('ytm-resize-handles');
+    if (overlay && overlay.parentElement === container && overlay.dataset.mode === mode) return;
+    if (overlay) overlay.remove();
+    if (getComputedStyle(container).position === 'static') {
+      container.style.position = 'relative';
+    }
+    overlay = document.createElement('div');
+    overlay.id = 'ytm-resize-handles';
+    overlay.dataset.mode = mode;
+    // Theater is full-bleed width by design: bottom (height) handle only
+    const kinds = mode === 'theater' ? ['s'] : ['e', 's', 'se'];
+    for (const kind of kinds) {
+      const h = document.createElement('div');
+      h.className = 'ytm-resize-handle ytm-resize-handle--' + kind;
+      h.addEventListener('pointerdown', e => startResizeDrag(e, h, kind, mode, container));
+      h.addEventListener('dblclick', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        resetPlayerSize(mode);
+      });
+      overlay.appendChild(h);
+    }
+    container.appendChild(overlay);
+  }
+
+  function startResizeDrag(e, handleEl, kind, mode, container) {
+    if (e.button !== 0 || resizeDrag) return;
+    e.preventDefault();
+    const rect = container.getBoundingClientRect();
+    const stored = (mode === 'theater'
+      ? cachedSettings?.playerSizeTheater : cachedSettings?.playerSizeDefault) || null;
+    const drag = {
+      kind, mode,
+      startX: e.clientX, startY: e.clientY,
+      startW: rect.width, startH: rect.height,
+      w: stored && stored.w != null ? stored.w : null,
+      h: stored && stored.h != null ? stored.h : null,
+      raf: 0, moved: false,
+    };
+    resizeDrag = drag;
+    try { handleEl.setPointerCapture(e.pointerId); } catch {}
+    const overlay = document.getElementById('ytm-resize-handles');
+    if (overlay) overlay.classList.add('ytm-resizing');
+
+    const onMove = ev => {
+      if (resizeDrag !== drag) return;
+      const maxW = Math.max(RESIZE_MIN_W, window.innerWidth - 24);
+      const maxH = Math.max(RESIZE_MIN_H, window.innerHeight - 120);
+      if (mode !== 'theater' && (kind === 'e' || kind === 'se')) {
+        drag.w = Math.round(Math.min(maxW, Math.max(RESIZE_MIN_W, drag.startW + (ev.clientX - drag.startX))));
+      }
+      if (kind === 's' || kind === 'se') {
+        drag.h = Math.round(Math.min(maxH, Math.max(RESIZE_MIN_H, drag.startH + (ev.clientY - drag.startY))));
+      }
+      drag.moved = true;
+      resizeOverride = mode === 'theater' ? { mode, h: drag.h } : { mode, w: drag.w, h: drag.h };
+      if (!drag.raf) {
+        drag.raf = requestAnimationFrame(() => { // one write + resize per frame max
+          drag.raf = 0;
+          writeResizeStyle();
+        });
+      }
+    };
+    const onUp = () => {
+      handleEl.removeEventListener('pointermove', onMove);
+      handleEl.removeEventListener('pointerup', onUp);
+      handleEl.removeEventListener('pointercancel', onUp);
+      if (overlay) overlay.classList.remove('ytm-resizing');
+      if (drag.raf) { cancelAnimationFrame(drag.raf); drag.raf = 0; }
+      resizeOverride = null;
+      resizeDrag = null;
+      if (!drag.moved) { writeResizeStyle(); return; }
+      // Persist ONCE on pointerup. Optimistic local cache keeps the style in
+      // place until the storage echo re-applies the identical CSS (harmless).
+      const key = mode === 'theater' ? 'playerSizeTheater' : 'playerSizeDefault';
+      const value = mode === 'theater' ? { h: drag.h } : { w: drag.w, h: drag.h };
+      cachedSettings = { ...(cachedSettings || {}), [key]: value };
+      writeResizeStyle();
+      safeSend({ type: 'UPDATE_SETTINGS', settings: { [key]: value } });
+    };
+    handleEl.addEventListener('pointermove', onMove);
+    handleEl.addEventListener('pointerup', onUp);
+    handleEl.addEventListener('pointercancel', onUp);
+  }
+
+  // Double-click any handle: restore YouTube's native sizing for this mode
+  // (the stored size for the OTHER mode is untouched)
+  function resetPlayerSize(mode) {
+    const key = mode === 'theater' ? 'playerSizeTheater' : 'playerSizeDefault';
+    cachedSettings = { ...(cachedSettings || {}), [key]: null };
+    writeResizeStyle(); // instant feedback; the storage echo is idempotent
+    safeSend({ type: 'UPDATE_SETTINGS', settings: { [key]: null } });
+  }
+
   // --- Thumbnail Indicators (show which videos are in the queue) ---
 
   const YTM_INDICATOR_STYLE_ID = 'ytm-indicator-style';
@@ -755,6 +1140,7 @@
     injectIndicatorStyles();
     refreshQueuedIds().then(applyThumbnailIndicators);
     startTracking();
+    resetSeekHistory(getCurrentVideoId());
     bindVideoFeatures();
     setTimeout(reportMetadata, 3000);
     setTimeout(applyYouTubeUI, 2000);
@@ -780,6 +1166,16 @@
       if (sc) sc.remove();
       const sec = document.querySelector('.ytm-comments-sidebar');
       if (sec) sec.classList.remove('ytm-comments-sidebar');
+      // Player stage (02): seek history and rate-sync arming are per-video —
+      // reset only when the videoId actually changed (t= param tweaks don't)
+      const navVideoId = getCurrentVideoId();
+      if (navVideoId !== seekHistoryVideoId) {
+        resetSeekHistory(navVideoId);
+        rateSyncArmedAt = 0;
+      }
+      // Re-attach the flexy attribute observer on the new page (the 3s
+      // applyYouTubeUI below reaches applyPlayerSize, which re-creates it)
+      if (resizeFlexyObserver) { resizeFlexyObserver.disconnect(); resizeFlexyObserver = null; }
       setTimeout(reportMetadata, 3000);
       setTimeout(applyYouTubeUI, 3000);
       bindVideoFeatures();

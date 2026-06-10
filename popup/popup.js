@@ -1,5 +1,12 @@
 function msg(data) { return chrome.runtime.sendMessage(data); }
 
+// speedLevel may hold ANY value in [0.1, 10] — native YouTube changes arrive
+// as 0.25-step values (contract: shared fmtSpeed rendering, ≤2 decimals; the
+// slider thumb rounds to the nearest 0.1 step but the label stays exact)
+function fmtSpeed(v) {
+  return Number(v).toFixed(2).replace(/(\.\d)0$/, '$1') + 'x';
+}
+
 // --- Stats ---
 async function loadStats() {
   try {
@@ -18,7 +25,7 @@ async function loadSettings() {
     document.getElementById('volume-value').textContent = s.volumeLevel + '%';
     document.getElementById('volume-scope').value = s.volumeScope;
     document.getElementById('speed-slider').value = Math.round(s.speedLevel * 10);
-    document.getElementById('speed-value').textContent = s.speedLevel.toFixed(1) + 'x';
+    document.getElementById('speed-value').textContent = fmtSpeed(s.speedLevel);
     document.getElementById('speed-scope').value = s.speedScope;
   } catch {}
 }
@@ -41,7 +48,7 @@ document.getElementById('volume-reset').addEventListener('click', () => {
 
 // --- Speed ---
 document.getElementById('speed-slider').addEventListener('input', e => {
-  document.getElementById('speed-value').textContent = (parseInt(e.target.value) / 10).toFixed(1) + 'x';
+  document.getElementById('speed-value').textContent = fmtSpeed(parseInt(e.target.value) / 10);
 });
 document.getElementById('speed-slider').addEventListener('change', e => {
   msg({ type: 'SET_SPEED', value: parseInt(e.target.value) / 10, scope: document.getElementById('speed-scope').value });
@@ -53,6 +60,33 @@ document.getElementById('speed-reset').addEventListener('click', () => {
   document.getElementById('speed-slider').value = 10;
   document.getElementById('speed-value').textContent = '1.0x';
   msg({ type: 'SET_SPEED', value: 1.0, scope: document.getElementById('speed-scope').value });
+});
+
+// Mid-drag guard: while the user is on the thumb, storage echoes (including
+// their own gesture's write) must not fight the pointer (stage 02)
+for (const sliderId of ['volume-slider', 'speed-slider']) {
+  const slider = document.getElementById(sliderId);
+  slider.addEventListener('pointerdown', () => { slider.dataset.dragging = '1'; });
+  slider.addEventListener('pointerup', () => { delete slider.dataset.dragging; });
+  slider.addEventListener('change', () => { delete slider.dataset.dragging; });
+}
+
+// Live slider/label sync (stage 02): the popup can sit open next to a YouTube
+// tab — native speed-menu changes land in yt_settings and must reflect here
+// without a reload (no polling; storage.onChanged only)
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !changes.yt_settings) return;
+  const s = changes.yt_settings.newValue || {};
+  const vs = document.getElementById('volume-slider');
+  if (!vs.dataset.dragging && s.volumeLevel !== undefined) {
+    vs.value = s.volumeLevel;
+    document.getElementById('volume-value').textContent = s.volumeLevel + '%';
+  }
+  const ss = document.getElementById('speed-slider');
+  if (!ss.dataset.dragging && s.speedLevel !== undefined) {
+    ss.value = Math.round(s.speedLevel * 10);
+    document.getElementById('speed-value').textContent = fmtSpeed(s.speedLevel);
+  }
 });
 
 // --- Stat Actions ---

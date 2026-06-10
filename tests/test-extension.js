@@ -118,6 +118,14 @@ async function run() {
     !!(await sidePanel.$('.toggle-bar--secondary #tb-export')));
   check('Suggested sort button present', !!(await sidePanel.$('.sort-btn[data-sort="suggested"]')));
 
+  // Player (stage 02): Resize toggle in the secondary row, before Export
+  check('Resize toggle present', !!(await sidePanel.$('#tb-resize')));
+  check('Resize toggle has data-desc', !!(await sidePanel.$('#tb-resize[data-desc]')));
+  check('Resize toggle lives in the secondary toggle-bar row before Export',
+    !!(await sidePanel.$('.toggle-bar--secondary #tb-resize + #tb-export, .toggle-bar--secondary #tb-resize ~ #tb-export')));
+  check('Resize toggle active by default (playerResizeEnabled true)',
+    await sidePanel.evaluate(() => document.getElementById('tb-resize').classList.contains('active')));
+
   await sidePanel.screenshot({ path: path.join(screenshotDir, 'sidepanel.png') });
   console.log('  Screenshot: screenshots/sidepanel.png');
 
@@ -142,6 +150,23 @@ async function run() {
   });
   const speedDisplay = await popup.textContent('#speed-value');
   check('Speed slider updates display', speedDisplay === '2.0x');
+
+  // fmtSpeed regression (stage 02): off-slider-step speedLevel values (e.g.
+  // a native 0.25x from YouTube's menu) render exactly, live via onChanged
+  await sw.evaluate(async () => {
+    const r = await chrome.storage.local.get('yt_settings');
+    await chrome.storage.local.set({ yt_settings: { ...(r.yt_settings || {}), speedLevel: 0.25 } });
+  });
+  await popup.waitForTimeout(400);
+  const offStepDisplay = await popup.textContent('#speed-value');
+  check('Off-step speed 0.25 renders as 0.25x (got ' + offStepDisplay + ')',
+    offStepDisplay === '0.25x');
+  // Restore the default so later checks still see pristine settings
+  await sw.evaluate(async () => {
+    const r = await chrome.storage.local.get('yt_settings');
+    await chrome.storage.local.set({ yt_settings: { ...(r.yt_settings || {}), speedLevel: 1.0 } });
+  });
+  await popup.waitForTimeout(300);
 
   await popup.screenshot({ path: path.join(screenshotDir, 'popup-interactions.png') });
   console.log('  Screenshot: screenshots/popup-interactions.png');

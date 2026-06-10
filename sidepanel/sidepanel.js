@@ -90,6 +90,13 @@ function fmtDate(d) {
   return new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+// speedLevel may hold ANY value in [0.1, 10] — native YouTube changes arrive
+// as 0.25-step values (contract: shared fmtSpeed rendering, ≤2 decimals; the
+// slider thumb rounds to the nearest 0.1 step but the label stays exact)
+function fmtSpeed(v) {
+  return Number(v).toFixed(2).replace(/(\.\d)0$/, '$1') + 'x';
+}
+
 function el(tag, attrs, children) {
   const n = document.createElement(tag);
   if (attrs) {
@@ -144,12 +151,15 @@ async function loadSettings() {
     document.getElementById('volume-slider').value = s.volumeLevel;
     document.getElementById('volume-value').textContent = s.volumeLevel + '%';
     document.getElementById('speed-slider').value = Math.round(s.speedLevel * 10);
-    document.getElementById('speed-value').textContent = s.speedLevel.toFixed(1) + 'x';
+    document.getElementById('speed-value').textContent = fmtSpeed(s.speedLevel);
 
     setInterceptState(s.interceptEnabled || 'off');
     document.getElementById('tb-autoplay').classList.toggle('active', !!s.autoPlayNext);
     document.getElementById('tb-videoinfo').classList.toggle('active', !!s.showVideoInfo);
     document.getElementById('tb-hiderecs').classList.toggle('active', !!s.hideRecs);
+    // Existing installs lack the key (onInstalled only seeds when settings
+    // are absent): undefined reads as the default true
+    document.getElementById('tb-resize').classList.toggle('active', s.playerResizeEnabled !== false);
 
     currentSort = s.sortBy || 'addedAt';
     if (currentSort === 'custom') currentSort = 'addedAt'; // 'suggested' passes through
@@ -660,6 +670,7 @@ const toggleMap = {
   'tb-autoplay': 'autoPlayNext',
   'tb-videoinfo': 'showVideoInfo',
   'tb-hiderecs': 'hideRecs',
+  'tb-resize': 'playerResizeEnabled',
 };
 
 // Intercept: 3-state cycle (off → close → keep → off)
@@ -918,7 +929,7 @@ document.getElementById('volume-reset').addEventListener('click', () => {
 
 // Speed
 document.getElementById('speed-slider').addEventListener('input', e => {
-  document.getElementById('speed-value').textContent = (parseInt(e.target.value) / 10).toFixed(1) + 'x';
+  document.getElementById('speed-value').textContent = fmtSpeed(parseInt(e.target.value) / 10);
 });
 document.getElementById('speed-slider').addEventListener('change', e => {
   msg({ type: 'SET_SPEED', value: parseInt(e.target.value) / 10, scope: 'tab' });
@@ -928,6 +939,15 @@ document.getElementById('speed-reset').addEventListener('click', () => {
   document.getElementById('speed-value').textContent = '1.0x';
   msg({ type: 'SET_SPEED', value: 1.0, scope: 'tab' });
 });
+
+// Mid-drag guard: while the user is on the thumb, storage echoes (including
+// their own gesture's write) must not fight the pointer (stage 02)
+for (const sliderId of ['volume-slider', 'speed-slider']) {
+  const slider = document.getElementById(sliderId);
+  slider.addEventListener('pointerdown', () => { slider.dataset.dragging = '1'; });
+  slider.addEventListener('pointerup', () => { delete slider.dataset.dragging; });
+  slider.addEventListener('change', () => { delete slider.dataset.dragging; });
+}
 
 // Collect tabs
 document.getElementById('collect-tabs').addEventListener('click', async () => {
@@ -997,6 +1017,23 @@ chrome.runtime.onMessage.addListener(m => { if (m.type === 'VIDEOS_UPDATED') sch
 // set arrives the same way from the SESSION area (worker is its sole writer)
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.yt_watch_time) loadWatchTime();
+  // Live slider/label sync (stage 02): native YouTube speed changes (and any
+  // other surface's slider) land in yt_settings — reflect them without a
+  // reload, skipping a slider the user is actively dragging
+  if (area === 'local' && changes.yt_settings) {
+    const s = changes.yt_settings.newValue || {};
+    const vs = document.getElementById('volume-slider');
+    if (!vs.dataset.dragging && s.volumeLevel !== undefined) {
+      vs.value = s.volumeLevel;
+      document.getElementById('volume-value').textContent = s.volumeLevel + '%';
+    }
+    const ss = document.getElementById('speed-slider');
+    if (!ss.dataset.dragging && s.speedLevel !== undefined) {
+      ss.value = Math.round(s.speedLevel * 10);
+      document.getElementById('speed-value').textContent = fmtSpeed(s.speedLevel);
+    }
+    document.getElementById('tb-resize').classList.toggle('active', s.playerResizeEnabled !== false);
+  }
   // Session list/pointer changes propagate via storage — no broadcast type;
   // multi-window panels converge on the same global active session for free
   if (area === 'local' && changes.yt_sessions) {
