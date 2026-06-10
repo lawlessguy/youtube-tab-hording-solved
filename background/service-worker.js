@@ -611,7 +611,9 @@ async function handleMessage(message, sender) {
     }
 
     case 'GET_MEDIA_STATE': {
-      const empty = { paused: true, currentTime: 0, duration: 0, videoId: null };
+      // Every return includes tabId so the panel can route media commands
+      // back to the tab it is actually displaying
+      const empty = { paused: true, currentTime: 0, duration: 0, videoId: null, tabId: null };
 
       async function queryTab(tabId) {
         try {
@@ -626,7 +628,7 @@ async function handleMessage(message, sender) {
         const state = await queryTab(activeTab.id);
         if (state && !state.paused) {
           lastPlayingTabId = activeTab.id;
-          return { paused: state.paused, currentTime: state.currentTime, duration: state.duration, videoId: state.videoId };
+          return state;
         }
       }
 
@@ -637,7 +639,7 @@ async function handleMessage(message, sender) {
           if (tab?.url?.includes('youtube.com')) {
             const state = await queryTab(lastPlayingTabId);
             if (state && !state.paused) {
-              return { paused: state.paused, currentTime: state.currentTime, duration: state.duration, videoId: state.videoId };
+              return state;
             }
           }
         } catch {
@@ -652,7 +654,7 @@ async function handleMessage(message, sender) {
         const state = await queryTab(t.id);
         if (state && !state.paused) {
           lastPlayingTabId = t.id;
-          return { paused: state.paused, currentTime: state.currentTime, duration: state.duration, videoId: state.videoId };
+          return state;
         }
       }
 
@@ -660,7 +662,7 @@ async function handleMessage(message, sender) {
       if (activeTab?.url?.includes('youtube.com')) {
         const state = await queryTab(activeTab.id);
         if (state) {
-          return { paused: state.paused, currentTime: state.currentTime, duration: state.duration, videoId: state.videoId };
+          return state;
         }
       }
 
@@ -772,20 +774,28 @@ async function handleMessage(message, sender) {
     }
 
     case MSG.MEDIA_CONTROL: {
-      // Forward media commands to the active YouTube tab
-      const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      if (activeTab && activeTab.url && activeTab.url.includes('youtube.com')) {
+      // Forward media commands to the tab the panel is displaying (passed as
+      // message.tabId), falling back to the active YouTube tab
+      let targetId = null;
+      if (message.tabId) {
         try {
-          const result = await chrome.tabs.sendMessage(activeTab.id, {
+          const tab = await chrome.tabs.get(message.tabId);
+          if (tab?.url?.includes('youtube.com')) targetId = tab.id;
+        } catch {}
+      }
+      if (!targetId) {
+        const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (activeTab?.url?.includes('youtube.com')) targetId = activeTab.id;
+      }
+      if (targetId) {
+        try {
+          return await chrome.tabs.sendMessage(targetId, {
             type: MSG.MEDIA_COMMAND,
             action: message.action,
           });
-          return result;
-        } catch {
-          return { success: false, error: 'No YouTube tab active' };
-        }
+        } catch {}
       }
-      return { success: false, error: 'No YouTube tab active' };
+      return { success: false, error: 'No YouTube tab found' };
     }
 
     case MSG.SKIP_VIDEO: {
@@ -822,11 +832,24 @@ async function handleMessage(message, sender) {
       }
 
       if (nextVideo) {
-        const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-        if (activeTab && activeTab.url && activeTab.url.includes('youtube.com')) {
-          extensionOpenedTabs.add(activeTab.id);
-          setTimeout(() => extensionOpenedTabs.delete(activeTab.id), 5000);
-          await chrome.tabs.update(activeTab.id, { url: nextVideo.url });
+        // Navigate the tab that was playing (passed by the panel), falling
+        // back to the active YouTube tab, else open a new tab — never hijack
+        // an unrelated tab the user is reading
+        let targetTab = null;
+        if (message.tabId) {
+          try {
+            const tab = await chrome.tabs.get(message.tabId);
+            if (tab?.url?.includes('youtube.com')) targetTab = tab;
+          } catch {}
+        }
+        if (!targetTab) {
+          const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+          if (activeTab?.url?.includes('youtube.com')) targetTab = activeTab;
+        }
+        if (targetTab) {
+          extensionOpenedTabs.add(targetTab.id);
+          setTimeout(() => extensionOpenedTabs.delete(targetTab.id), 5000);
+          await chrome.tabs.update(targetTab.id, { url: nextVideo.url });
           return { success: true, nextId: nextVideo.id };
         } else {
           const tab = await chrome.tabs.create({ url: nextVideo.url, active: true });

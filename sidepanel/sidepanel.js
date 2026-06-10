@@ -356,21 +356,22 @@ function buildNowPlayingCard(video, state) {
   const progressFill = el('div', { class: 'np-progress-fill', style: { width: pct + '%' } });
   const timeText = el('span', { class: 'np-time', text: dur(Math.floor(state.currentTime)) + ' / ' + dur(Math.floor(state.duration)) });
 
-  // Media buttons
-  const rewindBtn = el('button', { class: 'np-btn' }, [
-    el('svg', {}),
-    el('span', { class: 'np-btn-label', text: '10' }),
-  ]);
-  // Build SVGs via innerHTML on a wrapper (safe — no user data)
+  // Media buttons — commands carry the tabId of the tab being displayed so
+  // the service worker controls THAT video, not whatever tab is active
+  const mediaControl = action =>
+    msg({ type: 'MEDIA_CONTROL', action, tabId: lastMediaState?.tabId });
+
+  // Build SVGs via innerHTML (safe — no user data)
+  const rewindBtn = el('button', { class: 'np-btn' });
   rewindBtn.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg><span class="np-btn-label">10</span>';
-  rewindBtn.addEventListener('click', () => msg({ type: 'MEDIA_CONTROL', action: 'rewind' }));
+  rewindBtn.addEventListener('click', () => mediaControl('rewind'));
 
   const playPauseBtn = el('button', { class: 'np-btn np-btn--play' });
   playPauseBtn.innerHTML = state.paused
     ? '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><polygon points="6,3 20,12 6,21"/></svg>'
     : '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><rect x="5" y="3" width="5" height="18"/><rect x="14" y="3" width="5" height="18"/></svg>';
   playPauseBtn.addEventListener('click', async () => {
-    const r = await msg({ type: 'MEDIA_CONTROL', action: 'playPause' });
+    const r = await mediaControl('playPause');
     playPauseBtn.innerHTML = r.paused
       ? '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><polygon points="6,3 20,12 6,21"/></svg>'
       : '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><rect x="5" y="3" width="5" height="18"/><rect x="14" y="3" width="5" height="18"/></svg>';
@@ -378,12 +379,17 @@ function buildNowPlayingCard(video, state) {
 
   const forwardBtn = el('button', { class: 'np-btn' });
   forwardBtn.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.13-9.36L23 10"/></svg><span class="np-btn-label">10</span>';
-  forwardBtn.addEventListener('click', () => msg({ type: 'MEDIA_CONTROL', action: 'forward' }));
+  forwardBtn.addEventListener('click', () => mediaControl('forward'));
 
   const skipBtn = el('button', { class: 'np-btn np-btn--skip' });
   skipBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,4 15,12 5,20"/><rect x="17" y="5" width="3" height="14"/></svg>';
   skipBtn.addEventListener('click', async () => {
-    await msg({ type: 'SKIP_VIDEO', videoId: video.id, nextVideoIds: getVisibleVideoOrder() });
+    await msg({
+      type: 'SKIP_VIDEO',
+      videoId: video.id,
+      nextVideoIds: getVisibleVideoOrder(),
+      tabId: lastMediaState?.tabId,
+    });
     loadVideos();
   });
 
