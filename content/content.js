@@ -7,6 +7,11 @@
   let trackingInterval = null;
   let hasMarkedWatched = false;
   const FLUSH_INTERVAL = 30000;
+  // Watch telemetry (stage 06) — captured during the existing 1s playback
+  // tick, flushed with TRACK_WATCH_TIME. NOT reset on flush (maxPercent keeps
+  // accumulating across flushes); reset only on SPA navigation/video change.
+  let trackedVideoId = null, trackedUrl = null, trackedTitle = null,
+      trackedChannel = null, trackedDurationSec = 0, trackedMaxPercent = 0;
 
   // Check if the extension context is still valid (becomes invalid after reload/update)
   function isContextValid() {
@@ -164,6 +169,27 @@
         resumeAudioContext();
         accumulatedSeconds++;
         checkWatchProgress(video);
+
+        // Telemetry capture (no extra loop — rides this existing tick)
+        const vid = getCurrentVideoId();
+        if (vid && vid !== trackedVideoId) {
+          trackedVideoId = vid; trackedUrl = window.location.href;
+          trackedTitle = null; trackedChannel = null;
+          trackedDurationSec = 0; trackedMaxPercent = 0;
+        }
+        // Livestreams: duration === Infinity → isFinite guard leaves both 0
+        if (vid && isFinite(video.duration) && video.duration > 0) {
+          trackedDurationSec = Math.round(video.duration);
+          const pct = Math.min(100, Math.round((video.currentTime / video.duration) * 100));
+          if (pct > trackedMaxPercent) trackedMaxPercent = pct;
+        }
+        // Opportunistic title/channel scrape — no network fetches
+        if (vid && (!trackedTitle || !trackedChannel)) {
+          const t = document.title.replace(/\s*-\s*YouTube\s*$/, '').trim();
+          if (t && t !== 'YouTube') trackedTitle = trackedTitle || t;
+          const chEl = document.querySelector('#channel-name a, ytd-channel-name a, #owner #channel-name a');
+          trackedChannel = trackedChannel || chEl?.textContent?.trim() || null;
+        }
       }
     }, 1000);
 
@@ -191,8 +217,21 @@
 
   function flushWatchTime() {
     if (accumulatedSeconds < 1) return;
-    const minutes = accumulatedSeconds / 60;
-    safeSend({ type: 'TRACK_WATCH_TIME', minutes });
+    const payload = { type: 'TRACK_WATCH_TIME', minutes: accumulatedSeconds / 60 };
+    // Telemetry describes the video the seconds were accumulated AGAINST
+    // (trackers are captured during playback ticks and the SPA nav handler
+    // flushes BEFORE resetting them — never the new video)
+    if (trackedVideoId) {
+      payload.telemetry = {
+        videoId: trackedVideoId, url: trackedUrl,
+        isShort: /\/shorts\//.test(trackedUrl || ''),
+        secondsWatched: accumulatedSeconds,
+        maxPercent: trackedMaxPercent || null,
+        durationSec: trackedDurationSec || null,
+        title: trackedTitle, channel: trackedChannel,
+      };
+    }
+    safeSend(payload);
     accumulatedSeconds = 0;
   }
 
@@ -729,6 +768,10 @@
       flushWatchTime();
       accumulatedSeconds = 0;
       hasMarkedWatched = false;
+      // Telemetry trackers reset AFTER the flush above sent the old video's
+      // numbers — the next tick re-captures for the new video
+      trackedVideoId = null; trackedUrl = null; trackedTitle = null;
+      trackedChannel = null; trackedDurationSec = 0; trackedMaxPercent = 0;
       // Reset comments position on navigation (YouTube will re-render them)
       commentsMovedToSidebar = false;
       originalCommentsParent = null;

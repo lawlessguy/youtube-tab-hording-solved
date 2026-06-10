@@ -4,6 +4,7 @@ import {
   extractVideoId, isYouTubeUrl, isShortUrl, isYouTubeHost,
   fetchVideoMetadata, fetchVideoDetails, getThumbnailUrl
 } from '../utils/youtube.js';
+import { logActivity, getSuggestScores, EVENT_TYPES } from '../utils/activity-log.js';
 
 // Track recently created tabs for interception (tabId → createdAt) and tabs
 // opened by the extension itself (tabId → whitelist expiry). Both are
@@ -129,6 +130,11 @@ chrome.runtime.onInstalled.addListener(async () => {
   const watchTime = await storage.get(STORAGE_KEYS.WATCH_TIME);
   if (!watchTime) await storage.set(STORAGE_KEYS.WATCH_TIME, {});
 
+  // Activity log starts EMPTY — no backfill from yt_videos/yt_watch_time
+  // (synthetic timestamps would poison the recency term of suggest scoring)
+  const alog = await storage.get(STORAGE_KEYS.ACTIVITY_LOG);
+  if (!alog) await storage.set(STORAGE_KEYS.ACTIVITY_LOG, { v: 1, seq: 0, events: [] });
+
   await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
 });
 
@@ -171,6 +177,23 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   // Keep side panel enablement in sync when a tab navigates in place
   updateSidePanelForTab(tabId, changeInfo.url);
 
+  // Silent activity capture (stage 06): EVERY navigation to a watch/shorts
+  // URL — any tab, any window, intercept on or off — appends a video_opened
+  // event. Runs BEFORE the isRecentlyCreated gate so SPA navs and reloads in
+  // old tabs are captured too. Same tab+video within 60s dedupes inside
+  // logActivity. Fire-and-forget: the storage mutex serializes the append.
+  const navVideoId = extractVideoId(changeInfo.url);
+  if (navVideoId) {
+    logActivity({
+      type: 'video_opened',
+      videoId: navVideoId,
+      url: changeInfo.url,
+      isShort: isShortUrl(changeInfo.url),
+      source: isShortUrl(changeInfo.url) ? 'shorts' : 'browse',
+      tabId,
+    });
+  }
+
   await loadSessionState();
   if (!isRecentlyCreated(tabId)) return;
 
@@ -197,7 +220,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 
   recentlyCreatedTabs.delete(tabId);
   persistSessionState();
-  await addVideoToQueue(changeInfo.url, videoId);
+  await addVideoToQueue(changeInfo.url, videoId, undefined, undefined, { source: 'intercept' });
 
   // Never close the tab the user is looking at — queue it but keep it open.
   // Also protects restored sessions, where every tab fires onCreated.
@@ -290,10 +313,11 @@ async function logVideoSilently(url, videoId, starred) {
 
 // opts is the reconciled extension point (integration contract §4):
 // { bumpCount = true } (stage 05), { sessionId = active session, resolved
-// inside } (stage 04); stage 06 adds { source }. The same videoId may exist
-// once PER SESSION — the duplicate check is scoped to the resolved session.
+// inside } (stage 04), { source = 'manual' } (stage 06 — added_to_queue
+// event provenance). The same videoId may exist once PER SESSION — the
+// duplicate check is scoped to the resolved session.
 async function addVideoToQueue(url, videoId, explicitTimestamp, starred, opts = {}) {
-  const { bumpCount = true } = opts;
+  const { bumpCount = true, source = 'manual' } = opts;
   videoId = videoId || extractVideoId(url);
   if (!videoId) return null;
 
@@ -338,6 +362,14 @@ async function addVideoToQueue(url, videoId, explicitTimestamp, starred, opts = 
   broadcast({ type: MSG.VIDEOS_UPDATED });
 
   if (inserted) {
+    // New entries only — duplicate-bump logs nothing. Title/channel are still
+    // 'Loading...' placeholders at insert time, so log nulls; watch_progress
+    // telemetry enriches the channel picture later for free.
+    await logActivity({
+      type: 'added_to_queue', videoId, url,
+      title: null, channel: null, durationSec: null,
+      isShort: inserted.isShort, source, tabId: null,
+    });
     // Fetch title, channel, duration & upload date in background (non-blocking)
     enrichVideo(videoId);
   }
@@ -523,7 +555,8 @@ async function handleMessage(message, sender) {
       return await storage.get(STORAGE_KEYS.VIDEOS) || [];
 
     case MSG.ADD_VIDEO: {
-      const video = await addVideoToQueue(message.url, message.videoId);
+      const video = await addVideoToQueue(message.url, message.videoId,
+        undefined, undefined, { source: message.source || 'manual' });
       return video;
     }
 
@@ -532,20 +565,48 @@ async function handleMessage(message, sender) {
       // it, legacy all-entries-by-id behavior (content script callers)
       const matches = v => v.id === message.videoId &&
         (!message.sessionId || sessOf(v) === message.sessionId);
-      await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) =>
-        videos.filter(v => !matches(v)));
+      // Capture the removed entry in the updateFn closure (no second read);
+      // logActivity runs AFTER the update resolves — never inside updateFn
+      let removed = null;
+      await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
+        removed = videos.find(matches) || null;
+        return videos.filter(v => !matches(v));
+      });
+      if (removed) {
+        await logActivity({
+          type: 'removed', videoId: message.videoId,
+          title: removed.title ?? null, channel: removed.channel ?? null,
+          durationSec: removed.duration ?? null, isShort: removed.isShort,
+          source: 'manual', tabId: null,
+        });
+      }
       return { success: true };
     }
 
     case MSG.UPDATE_VIDEO: {
       const matches = v => v.id === message.videoId &&
         (!message.sessionId || sessOf(v) === message.sessionId);
+      let wasWatched = null;
+      let updated = null;
       await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
         const video = videos.find(matches);
         if (!video) return undefined;
+        wasWatched = video.watched;
         Object.assign(video, message.updates);
+        updated = video;
         return videos;
       });
+      // Manual mark-watched from the panel; un-marking is deliberately not
+      // logged (no event type for it). wasWatched guard: re-marking an
+      // already-watched entry appends nothing.
+      if (message.updates?.watched === true && wasWatched === false) {
+        await logActivity({
+          type: 'marked_watched', videoId: message.videoId,
+          title: updated?.title ?? null, channel: updated?.channel ?? null,
+          durationSec: updated?.duration ?? null, isShort: updated?.isShort,
+          source: 'manual', tabId: null,
+        });
+      }
       return { success: true };
     }
 
@@ -569,7 +630,8 @@ async function handleMessage(message, sender) {
         const videoId = extractVideoId(tab.url);
         if (videoId) {
           const timestamp = baseTime + (ytTabs.length - i);
-          const video = await addVideoToQueue(tab.url, videoId, timestamp, undefined, { bumpCount: false, sessionId: sid });
+          const video = await addVideoToQueue(tab.url, videoId, timestamp, undefined,
+            { bumpCount: false, sessionId: sid, source: 'collect' });
           if (video) added++;
         }
       }
@@ -582,7 +644,8 @@ async function handleMessage(message, sender) {
         return [];
       });
       for (const entry of drained) {
-        const video = await addVideoToQueue(entry.url, entry.id, entry.timestamp, entry.starred, { bumpCount: false, sessionId: sid });
+        const video = await addVideoToQueue(entry.url, entry.id, entry.timestamp, entry.starred,
+          { bumpCount: false, sessionId: sid, source: 'collect' });
         if (video) added++;
       }
 
@@ -652,6 +715,19 @@ async function handleMessage(message, sender) {
         watchTime[todayKey] = (watchTime[todayKey] || 0) + message.minutes;
         return watchTime;
       });
+      // Optional telemetry (stage 06) → watch_progress event. Old senders
+      // without it stay valid and skip the log entirely.
+      const t = message.telemetry;
+      if (t?.videoId && typeof t.secondsWatched === 'number') {
+        await logActivity({
+          type: 'watch_progress', videoId: t.videoId,
+          url: t.url ?? null, title: t.title ?? null, channel: t.channel ?? null,
+          durationSec: t.durationSec ?? null, isShort: !!t.isShort,
+          secondsWatched: Math.round(t.secondsWatched),
+          maxPercent: Number.isFinite(t.maxPercent) ? Math.min(100, Math.round(t.maxPercent)) : null,
+          source: 'content', tabId: sender.tab?.id ?? null,
+        });
+      }
       return { success: true };
     }
 
@@ -883,6 +959,22 @@ async function handleMessage(message, sender) {
       });
       if (marked) broadcast({ type: MSG.VIDEOS_UPDATED });
 
+      // One batch → one update → contiguous seqs (skip yields up to 2 events)
+      const skipEvents = [{
+        type: 'skipped', videoId: currentVideoId ?? null,
+        source: 'manual', tabId: message.tabId ?? null,
+      }];
+      if (marked) {
+        const mv = videos.find(v => v.id === currentVideoId);
+        skipEvents.push({
+          type: 'marked_watched', videoId: currentVideoId,
+          title: mv?.title ?? null, channel: mv?.channel ?? null,
+          durationSec: mv?.duration ?? null, isShort: mv?.isShort,
+          source: 'manual', tabId: message.tabId ?? null,
+        });
+      }
+      await logActivity(skipEvents);
+
       // Use the ordered next-video list from the side panel if provided
       let nextVideo = null;
       const nextIds = message.nextVideoIds || [];
@@ -933,20 +1025,45 @@ async function handleMessage(message, sender) {
       // Content-script callers have no session context — mark EVERY entry
       // with this id, across all sessions (contract §3)
       let changed = false;
+      let markedVideo = null; // captured in the updateFn closure — no second read
       await storage.update(STORAGE_KEYS.VIDEOS, (videos = []) => {
         for (const video of videos) {
           if (video.id === message.videoId && !video.watched) {
             video.watched = true;
             changed = true;
+            if (!markedVideo) markedVideo = video;
           }
         }
         return changed ? videos : undefined;
       });
-      if (changed) broadcast({ type: MSG.VIDEOS_UPDATED });
+      if (changed) {
+        broadcast({ type: MSG.VIDEOS_UPDATED });
+        // source 'content' = the 20% auto-rule (manual panel marks go through
+        // UPDATE_VIDEO with source 'manual')
+        await logActivity({
+          type: 'marked_watched', videoId: message.videoId,
+          title: markedVideo?.title ?? null, channel: markedVideo?.channel ?? null,
+          durationSec: markedVideo?.duration ?? null, isShort: markedVideo?.isShort,
+          source: 'content', tabId: sender.tab?.id ?? null,
+        });
+      }
       return { success: true };
     }
 
     case MSG.VIDEO_ENDED: {
+      // Completion is logged BEFORE the autoPlayNext early-return — the event
+      // fires even with Autoplay off (stage 06, plan decision #14)
+      if (message.videoId) {
+        const known = ((await storage.get(STORAGE_KEYS.VIDEOS)) || [])
+          .find(v => v.id === message.videoId);
+        await logActivity({
+          type: 'video_completed', videoId: message.videoId,
+          title: known?.title ?? null, channel: known?.channel ?? null,
+          durationSec: known?.duration ?? null, isShort: known?.isShort,
+          maxPercent: 100, source: 'content', tabId: sender.tab?.id ?? null,
+        });
+      }
+
       const settings = await storage.get(STORAGE_KEYS.SETTINGS);
       if (!settings?.autoPlayNext) return { autoPlayed: false };
 
@@ -994,14 +1111,19 @@ async function handleMessage(message, sender) {
       const name = (message.name || '').trim().slice(0, 40);
       if (!name) return { error: 'Empty name' };
       const session = { id: newSessionId(), name, createdAt: Date.now() };
+      let fromSessionId = null;
       const updated = await storage.update(STORAGE_KEYS.SESSIONS, (s) => {
         s = normalizeSessions(s);
+        fromSessionId = s.activeId || 'main';
         s.list.push(session);
         s.activeId = session.id; // creating switches to it
         return s;
       });
-      // Stage 06 seam: append the session_created/session_switched activity
-      // event here (single call site)
+      // Stage 06: creating a session switches to it — one event, one call site
+      await logActivity({
+        type: 'session_switched', videoId: null, source: 'manual', tabId: null,
+        sessionId: session.id, fromSessionId, reason: 'create',
+      });
       return { session, activeId: updated.activeId };
     }
 
@@ -1023,15 +1145,23 @@ async function handleMessage(message, sender) {
 
     case MSG.SET_ACTIVE_SESSION: {
       let activeId = null;
+      let fromSessionId = null;
       await storage.update(STORAGE_KEYS.SESSIONS, (s) => {
         s = normalizeSessions(s);
         if (!s.list.some(x => x.id === message.sessionId)) return undefined;
+        fromSessionId = s.activeId || 'main';
         s.activeId = message.sessionId;
         activeId = s.activeId;
         return s;
       });
       if (!activeId) return { error: 'Not found' };
-      // Stage 06 seam: append the session_switched activity event here
+      // Stage 06: switching to the already-active session logs nothing
+      if (fromSessionId !== activeId) {
+        await logActivity({
+          type: 'session_switched', videoId: null, source: 'manual', tabId: null,
+          sessionId: activeId, fromSessionId, reason: 'switch',
+        });
+      }
       return { success: true, activeId };
     }
 
@@ -1055,7 +1185,12 @@ async function handleMessage(message, sender) {
         if (s.activeId === sid) s.activeId = 'main';
         return s;
       });
-      // Stage 06 seam: append the session_deleted activity event here
+      // Stage 06: deletion event — the deleted session is the "from" side
+      await logActivity({
+        type: 'session_switched', videoId: null, source: 'manual', tabId: null,
+        sessionId: sessions.activeId === sid ? 'main' : sessions.activeId,
+        fromSessionId: sid, reason: 'delete',
+      });
       broadcast({ type: MSG.VIDEOS_UPDATED });
       return { success: true, removedVideos: removed };
     }
@@ -1094,9 +1229,31 @@ async function handleMessage(message, sender) {
         s.activeId = 'main';
         return s;
       });
-      // Stage 06 seam: append the session_merged activity event here
+      // Stage 06: merging always lands in Main
+      await logActivity({
+        type: 'session_switched', videoId: null, source: 'manual', tabId: null,
+        sessionId: 'main', fromSessionId: sid, reason: 'merge',
+      });
       broadcast({ type: MSG.VIDEOS_UPDATED });
       return { success: true, moved, duplicates };
+    }
+
+    // --- Analytics (stage 06) ---
+
+    case MSG.GET_SUGGEST_SCORES:
+      // Lazy + cached inside getSuggestScores — recompute only when the log
+      // advanced 25+ events past the cache; never on plain panel renders
+      return await getSuggestScores();
+
+    case MSG.LOG_ACTIVITY_EVENT: {
+      // Generic append hook for other UI surfaces/feature groups — type
+      // validated against the allowlist; tabId defaults to the sender's tab
+      const ev = message.event;
+      if (!ev || !EVENT_TYPES.has(ev.type)) {
+        return { success: false, error: 'invalid event' };
+      }
+      await logActivity({ ...ev, tabId: ev.tabId ?? sender.tab?.id ?? null });
+      return { success: true };
     }
 
     case MSG.OPEN_SIDE_PANEL: {

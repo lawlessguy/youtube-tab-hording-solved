@@ -130,6 +130,26 @@ function check(label, condition, detail) {
   check('Watch time updated without polling (was ' + wtBefore + ', now ' + wtAfter + ')',
     wtAfter === '42m');
 
+  // --- No render storms off the activity log (stage 06) ---
+  // Under the default (Added) sort, a yt_activity_log write must NOT trigger
+  // loadVideos: plant a marker inside #video-list — any re-render rebuilds
+  // the container's children and would wipe it.
+  console.log('\n--- Activity log writes do not re-render the default panel ---');
+  await panel.evaluate(() => {
+    const marker = document.createElement('div');
+    marker.id = 'render-marker';
+    document.getElementById('video-list').appendChild(marker);
+  });
+  await sw.evaluate(() => chrome.storage.local.set({
+    yt_activity_log: {
+      v: 1, seq: 1,
+      events: [{ seq: 1, ts: Date.now(), type: 'marked_watched', videoId: 'RENDERTEST1' }],
+    },
+  }));
+  await panel.waitForTimeout(1200);
+  check('Panel did not re-render on yt_activity_log change (marker intact)',
+    await panel.evaluate(() => !!document.getElementById('render-marker')));
+
   await context.close();
 
   console.log('\n=============================');

@@ -21,6 +21,25 @@ let confirmTimer = null;
 // videoIds currently open in any Chrome tab — worker-maintained, read from
 // chrome.storage.session (worker is the sole writer; see loadOpenTabIds)
 let openTabIds = new Set();
+// Suggested-sort scores: fetched from the worker (which lazily recomputes +
+// caches); the panel additionally throttles its own requests to one per 60s.
+// Never recomputed on plain renders.
+let suggestScores = { channels: {} };
+let lastScoreFetch = 0;
+
+async function loadSuggestScores(force) {
+  if (!force && Date.now() - lastScoreFetch < 60000) return;
+  lastScoreFetch = Date.now();
+  try {
+    const r = await msg({ type: 'GET_SUGGEST_SCORES' });
+    if (r?.channels) suggestScores = r;
+  } catch {}
+}
+
+function channelScore(v) {
+  const key = (v.channel || '').trim().toLowerCase();
+  return suggestScores.channels[key]?.score ?? 0;
+}
 
 // Virtual scroll data — full sorted arrays (not rendered to DOM)
 let dataVideos = [];
@@ -133,9 +152,10 @@ async function loadSettings() {
     document.getElementById('tb-hiderecs').classList.toggle('active', !!s.hideRecs);
 
     currentSort = s.sortBy || 'addedAt';
-    if (currentSort === 'custom') currentSort = 'addedAt';
+    if (currentSort === 'custom') currentSort = 'addedAt'; // 'suggested' passes through
     sortDirection = s.sortDirection || 'desc';
     updateSortUI();
+    if (currentSort === 'suggested') loadSuggestScores(true).then(loadVideos);
   } catch {}
 }
 
@@ -342,6 +362,11 @@ function sortVids(videos) {
       case 'uploadedAt':
         va = a.uploadedAt ? new Date(a.uploadedAt).getTime() : 0;
         vb = b.uploadedAt ? new Date(b.uploadedAt).getTime() : 0; break;
+      case 'suggested': {
+        va = channelScore(a); vb = channelScore(b);
+        if (va === vb) { va = a.addedAt || 0; vb = b.addedAt || 0; } // stable cold-start fallback
+        break;
+      }
       default: va = a.addedAt || 0; vb = b.addedAt || 0;
     }
     return sortDirection === 'asc' ? va - vb : vb - va;
@@ -431,7 +456,10 @@ function buildVideoItem(v, _unused, isWatched) {
   const item = el('div', {
     class: 'video-item' + (isWatched ? ' watched' : ''),
     'data-id': v.id,
-    draggable: isWatched ? 'false' : 'true',
+    // Suggested sort: drop is a no-op anyway, so don't offer the drag at all.
+    // Must be a real boolean: el() assigns DOM properties, and the string
+    // 'false' would coerce to draggable=true.
+    draggable: !isWatched && currentSort !== 'suggested',
   }, [
     thumbWrap,
     el('div', { class: 'video-info' }, [
@@ -678,6 +706,33 @@ document.querySelectorAll('.toggle-bar [data-desc]').forEach(btn => {
   btn.addEventListener('mouseenter', () => { descEl.textContent = btn.dataset.desc; });
 });
 
+// Export activity log as JSON — Blob + <a download> from this extension
+// document (no permissions). Reads the key directly (read-only, no mutex
+// needed — consistent with the panel's direct yt_next_video_order writes).
+document.getElementById('tb-export').addEventListener('click', async () => {
+  const r = await chrome.storage.local.get('yt_activity_log'); // literal key — plain script
+  const log = r.yt_activity_log || { v: 1, seq: 0, events: [] };
+  const payload = {
+    schema: 'yt_activity_log',
+    schemaVersion: log.v,
+    exportedAt: new Date().toISOString(),
+    eventCount: log.events.length,
+    seq: log.seq,
+    events: log.events,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 1)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const d = new Date();
+  const stamp = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'yt-activity-log-' + stamp + '.json';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000); // let the download start safely
+});
+
 // --- Drag and Drop ---
 // dragId/dragInProgress live at module scope: a re-render swaps in fresh
 // cards with fresh listeners, and closure-local state would orphan the drag
@@ -709,6 +764,10 @@ function setupDragDrop(container) {
     item.addEventListener('drop', async e => {
       e.preventDefault();
       item.classList.remove('drag-over');
+      // No drag-reorder under Suggested sort: reorder works by swapping the
+      // active sort field between two videos, and there is no per-video
+      // "suggested" field to swap (swapping addedAt would corrupt Added sort)
+      if (currentSort === 'suggested') return;
       if (!dragId || item.dataset.id === dragId) return;
 
       // Scope to the active session — a same-id entry in another session
@@ -892,14 +951,15 @@ document.getElementById('star-filter').addEventListener('click', () => {
   document.querySelector('.scroll-area').scrollTop = 0;
 });
 
-// Sort
+// Sort — Suggested refreshes scores first (forced, but the worker side is
+// still cache-gated by the 25-event seq delta)
 document.querySelectorAll('.sort-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     currentSort = btn.dataset.sort;
     updateSortUI();
     msg({ type: 'UPDATE_SETTINGS', settings: { sortBy: currentSort } });
-    loadVideos();
-    document.querySelector('.scroll-area').scrollTop = 0;
+    const apply = () => { loadVideos(); document.querySelector('.scroll-area').scrollTop = 0; };
+    if (currentSort === 'suggested') loadSuggestScores(true).then(apply); else apply();
   });
 });
 document.getElementById('sort-direction').addEventListener('click', () => {
@@ -946,6 +1006,13 @@ chrome.storage.onChanged.addListener((changes, area) => {
     renderSessionBar();
     if (prev !== activeSessionId) clearChannelFilter(false);
     scheduleLoadVideos();
+  }
+  // Activity-log appends refresh suggest scores ONLY while Suggested sort is
+  // active — throttled by lastScoreFetch's 60s gate plus the worker's
+  // seq-delta gate. No listener re-renders off the log otherwise (no render
+  // storms during intercept bursts/Collect).
+  if (area === 'local' && changes.yt_activity_log && currentSort === 'suggested') {
+    loadSuggestScores().then(() => { if (currentSort === 'suggested') scheduleLoadVideos(); });
   }
   if (area === 'session' && changes.yt_open_tab_ids) {
     openTabIds = new Set(changes.yt_open_tab_ids.newValue || []);

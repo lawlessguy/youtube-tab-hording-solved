@@ -111,6 +111,13 @@ async function run() {
   });
   check('Channel chip present but hidden by default', chipHidden === true);
 
+  // Analytics (stage 06): Export in the SECOND toggle-bar row + Suggest sort
+  check('Export button present', !!(await sidePanel.$('#tb-export')));
+  check('Export button has data-desc', !!(await sidePanel.$('#tb-export[data-desc]')));
+  check('Export button lives in the secondary toggle-bar row',
+    !!(await sidePanel.$('.toggle-bar--secondary #tb-export')));
+  check('Suggested sort button present', !!(await sidePanel.$('.sort-btn[data-sort="suggested"]')));
+
   await sidePanel.screenshot({ path: path.join(screenshotDir, 'sidepanel.png') });
   console.log('  Screenshot: screenshots/sidepanel.png');
 
@@ -214,15 +221,16 @@ async function run() {
   check('Legacy video backfilled sessionId main', normalizedLegacy?.sessionId === 'main');
   check('Legacy video backfilled addCount 1', normalizedLegacy?.addCount === 1);
 
-  // Secondary toggle-bar row scaffold: present in DOM, hidden while empty
+  // Secondary toggle-bar row scaffold: stage 06 appended #tb-export, so the
+  // row is populated and the :empty auto-hide no longer applies
   const secondaryBar = await sidePanel.evaluate(() => {
     const el = document.querySelector('.toggle-bar--secondary');
     if (!el) return null;
-    return { empty: el.childElementCount === 0, display: getComputedStyle(el).display };
+    return { count: el.childElementCount, display: getComputedStyle(el).display };
   });
   check('Secondary toggle-bar row present', !!secondaryBar);
-  check('Secondary toggle-bar hidden while empty',
-    secondaryBar?.empty === true && secondaryBar?.display === 'none');
+  check('Secondary toggle-bar visible once populated',
+    secondaryBar?.count >= 1 && secondaryBar?.display !== 'none');
 
   // --- Test 6: Volume boost on a controlled page ---
   console.log('\n--- Test 6: Volume Boost ---');

@@ -145,6 +145,32 @@ function check(label, condition, detail) {
   check('activeId points at an existing session',
     sessState.list.some(s => s.id === sessState.activeId));
 
+  // --- Test 6: concurrent LOG_ACTIVITY_EVENT — no loss, contiguous seqs ---
+  console.log('\n--- Race 6: 20 concurrent LOG_ACTIVITY_EVENT ---');
+  await sw.evaluate(() => chrome.storage.local.set({
+    yt_activity_log: { v: 1, seq: 0, events: [] },
+  }));
+  await page.evaluate(async () => {
+    const sends = [];
+    for (let i = 0; i < 20; i++) {
+      sends.push(chrome.runtime.sendMessage({
+        type: 'LOG_ACTIVITY_EVENT',
+        event: { type: 'marked_watched', videoId: 'RACEVIDEO' + String(i).padStart(2, '0') },
+      }));
+    }
+    await Promise.all(sends);
+  });
+  const logState = await sw.evaluate(async () => {
+    const r = await chrome.storage.local.get('yt_activity_log');
+    return r.yt_activity_log;
+  });
+  check('All 20 events recorded (got ' + (logState?.events?.length ?? 0) + ')',
+    logState?.events?.length === 20);
+  const seqs = (logState?.events || []).map(e => e.seq);
+  check('Seqs are 20 distinct contiguous values in order',
+    seqs.length === 20 && seqs.every((s, i) => s === i + 1));
+  check('Log seq counter is 20', logState?.seq === 20);
+
   await context.close();
 
   console.log('\n=============================');

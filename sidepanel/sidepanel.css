@@ -119,6 +119,9 @@ header {
 .tb-btn--intercept.intercept-close { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
 .tb-btn--intercept.intercept-keep { color: #2ba640; border-color: #2ba640; background: rgba(43,166,64,0.12); }
 
+/* Export: green like refresh */
+.tb-btn--export:hover { color: #2ba640; border-color: #2ba640; background: rgba(43,166,64,0.1); }
+
 /* Toggle active state (for intercept, autoplay, videoinfo, hiderecs) */
 .tb-btn.active { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
 
@@ -161,13 +164,14 @@ header {
 
 .sort-btns { display: flex; gap: 3px; align-items: center; }
 
+/* Four sort buttons must fit a 350px row (stage 06 added Suggest) */
 .sort-btn {
   background: var(--bg-card);
   color: var(--text2);
   border: 1px solid var(--border);
   border-radius: 4px;
-  padding: 2px 7px;
-  font-size: 11px;
+  padding: 2px 5px;
+  font-size: 10.5px;
   cursor: pointer;
   transition: all 0.2s;
 }
@@ -212,6 +216,7 @@ header {
 
 .search-inline {
   flex: 1;
+  min-width: 70px; /* may compress next to 4 sort buttons but stays usable */
   display: flex;
   align-items: center;
   gap: 4px;
