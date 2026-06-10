@@ -5,12 +5,69 @@ import {
   fetchVideoMetadata, fetchVideoDetails, getThumbnailUrl
 } from '../utils/youtube.js';
 
-// Track recently created tabs for interception
+// Track recently created tabs for interception (tabId → createdAt) and tabs
+// opened by the extension itself (tabId → whitelist expiry). Both are
+// mirrored in chrome.storage.session because the MV3 worker is idle-killed:
+// purely in-memory state made interception lossy across restarts. Expiry is
+// checked on read — setTimeout cleanup does not survive worker death.
+const RECENT_TAB_TTL = 10000;
 const recentlyCreatedTabs = new Map();
-// Tabs opened by the extension itself (whitelist from interception)
-const extensionOpenedTabs = new Set();
-// Track the last tab that had a playing video
+const extensionOpenedTabs = new Map();
+// Track the last tab that had a playing video (best-effort; loss is benign)
 let lastPlayingTabId = null;
+
+let sessionStateReady = null;
+function loadSessionState() {
+  if (!sessionStateReady) {
+    sessionStateReady = (async () => {
+      try {
+        const data = await chrome.storage.session.get(['recentTabs', 'extOpenedTabs']);
+        const now = Date.now();
+        for (const [id, ts] of Object.entries(data.recentTabs || {})) {
+          if (now - ts < RECENT_TAB_TTL && !recentlyCreatedTabs.has(Number(id))) {
+            recentlyCreatedTabs.set(Number(id), ts);
+          }
+        }
+        for (const [id, expiry] of Object.entries(data.extOpenedTabs || {})) {
+          if (expiry > now && !extensionOpenedTabs.has(Number(id))) {
+            extensionOpenedTabs.set(Number(id), expiry);
+          }
+        }
+      } catch {}
+    })();
+  }
+  return sessionStateReady;
+}
+
+function persistSessionState() {
+  const now = Date.now();
+  for (const [id, ts] of recentlyCreatedTabs) {
+    if (now - ts >= RECENT_TAB_TTL) recentlyCreatedTabs.delete(id);
+  }
+  for (const [id, expiry] of extensionOpenedTabs) {
+    if (expiry <= now) extensionOpenedTabs.delete(id);
+  }
+  chrome.storage.session.set({
+    recentTabs: Object.fromEntries(recentlyCreatedTabs),
+    extOpenedTabs: Object.fromEntries(extensionOpenedTabs),
+  }).catch(() => {});
+}
+
+function isRecentlyCreated(tabId) {
+  const ts = recentlyCreatedTabs.get(tabId);
+  return ts !== undefined && Date.now() - ts < RECENT_TAB_TTL;
+}
+
+function isExtensionOpenedTab(tabId) {
+  const expiry = extensionOpenedTabs.get(tabId);
+  return expiry !== undefined && expiry > Date.now();
+}
+
+async function whitelistExtensionTab(tabId, ttlMs) {
+  await loadSessionState();
+  extensionOpenedTabs.set(tabId, Date.now() + ttlMs);
+  persistSessionState();
+}
 
 // --- Initialization ---
 
@@ -54,19 +111,26 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 
 // --- Tab Interception ---
 
-chrome.tabs.onCreated.addListener((tab) => {
+chrome.tabs.onCreated.addListener(async (tab) => {
+  await loadSessionState();
   recentlyCreatedTabs.set(tab.id, Date.now());
-  setTimeout(() => recentlyCreatedTabs.delete(tab.id), 10000);
+  persistSessionState();
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (!changeInfo.url) return;
-  if (!recentlyCreatedTabs.has(tabId)) return;
+
+  // Keep side panel enablement in sync when a tab navigates in place
+  updateSidePanelForTab(tabId, changeInfo.url);
+
+  await loadSessionState();
+  if (!isRecentlyCreated(tabId)) return;
 
   // Skip tabs opened by the extension itself
-  if (extensionOpenedTabs.has(tabId)) {
+  if (isExtensionOpenedTab(tabId)) {
     extensionOpenedTabs.delete(tabId);
     recentlyCreatedTabs.delete(tabId);
+    persistSessionState();
     return;
   }
 
@@ -84,9 +148,12 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (interceptMode === 'off') return;
 
   recentlyCreatedTabs.delete(tabId);
+  persistSessionState();
   await addVideoToQueue(changeInfo.url, videoId);
 
-  if (interceptMode === 'close') {
+  // Never close the tab the user is looking at — queue it but keep it open.
+  // Also protects restored sessions, where every tab fires onCreated.
+  if (interceptMode === 'close' && !tab.active) {
     try {
       await chrome.tabs.remove(tabId);
     } catch (e) {
@@ -97,8 +164,11 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   broadcast({ type: MSG.VIDEOS_UPDATED });
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => {
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await loadSessionState();
   recentlyCreatedTabs.delete(tabId);
+  extensionOpenedTabs.delete(tabId);
+  persistSessionState();
   if (lastPlayingTabId === tabId) lastPlayingTabId = null;
 });
 
@@ -191,6 +261,14 @@ async function enrichVideo(videoId) {
 
 async function getTabStats() {
   const tabs = await chrome.tabs.query({});
+  // Consider the active tab first so it is always the keeper of its videoId
+  // and never lands in duplicateTabIds (closing dupes must not close the tab
+  // the user is watching)
+  const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (activeTab) {
+    const idx = tabs.findIndex(t => t.id === activeTab.id);
+    if (idx > 0) tabs.unshift(tabs.splice(idx, 1)[0]);
+  }
   let ytTabs = 0;
   let shortsTabs = 0;
   const urlCounts = {};
@@ -707,22 +785,19 @@ async function handleMessage(message, sender) {
       // Smart open: replace current YT tab or open new tab
       const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       if (activeTab && activeTab.url && activeTab.url.includes('youtube.com')) {
-        extensionOpenedTabs.add(activeTab.id);
-        setTimeout(() => extensionOpenedTabs.delete(activeTab.id), 5000);
+        await whitelistExtensionTab(activeTab.id, 5000);
         await chrome.tabs.update(activeTab.id, { url: message.url });
         return { tabId: activeTab.id, replaced: true };
       } else {
         const tab = await chrome.tabs.create({ url: message.url, active: true });
-        extensionOpenedTabs.add(tab.id);
-        setTimeout(() => extensionOpenedTabs.delete(tab.id), 30000);
+        await whitelistExtensionTab(tab.id, 30000);
         return { tabId: tab.id, replaced: false };
       }
     }
 
     case MSG.OPEN_VIDEO_NEW_TAB: {
       const tab = await chrome.tabs.create({ url: message.url, active: false });
-      extensionOpenedTabs.add(tab.id);
-      setTimeout(() => extensionOpenedTabs.delete(tab.id), 30000);
+      await whitelistExtensionTab(tab.id, 30000);
       return { tabId: tab.id };
     }
 
@@ -847,14 +922,12 @@ async function handleMessage(message, sender) {
           if (activeTab?.url?.includes('youtube.com')) targetTab = activeTab;
         }
         if (targetTab) {
-          extensionOpenedTabs.add(targetTab.id);
-          setTimeout(() => extensionOpenedTabs.delete(targetTab.id), 5000);
+          await whitelistExtensionTab(targetTab.id, 5000);
           await chrome.tabs.update(targetTab.id, { url: nextVideo.url });
           return { success: true, nextId: nextVideo.id };
         } else {
           const tab = await chrome.tabs.create({ url: nextVideo.url, active: true });
-          extensionOpenedTabs.add(tab.id);
-          setTimeout(() => extensionOpenedTabs.delete(tab.id), 30000);
+          await whitelistExtensionTab(tab.id, 30000);
           return { success: true, nextId: nextVideo.id };
         }
       }
@@ -900,8 +973,7 @@ async function handleMessage(message, sender) {
       if (nextVideo) {
         const tabId = sender.tab?.id;
         if (tabId) {
-          extensionOpenedTabs.add(tabId);
-          setTimeout(() => extensionOpenedTabs.delete(tabId), 5000);
+          await whitelistExtensionTab(tabId, 5000);
           await chrome.tabs.update(tabId, { url: nextVideo.url });
           return { autoPlayed: true, videoId: nextVideo.id };
         }
@@ -911,13 +983,15 @@ async function handleMessage(message, sender) {
 
     case MSG.OPEN_TAB: {
       const tab = await chrome.tabs.create({ url: message.url });
-      extensionOpenedTabs.add(tab.id);
-      setTimeout(() => extensionOpenedTabs.delete(tab.id), 30000);
+      await whitelistExtensionTab(tab.id, 30000);
       return { tabId: tab.id };
     }
 
     case MSG.OPEN_SIDE_PANEL: {
       if (message.tabId) {
+        // Opening from the popup is an explicit request — re-enable first in
+        // case this tab was disabled as a non-YouTube tab
+        await chrome.sidePanel.setOptions({ tabId: message.tabId, enabled: true });
         await chrome.sidePanel.open({ tabId: message.tabId });
       }
       return { success: true };

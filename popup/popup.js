@@ -70,7 +70,12 @@ document.getElementById('close-shorts').addEventListener('click', async () => {
 document.getElementById('open-sidepanel').addEventListener('click', async () => {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab) await chrome.sidePanel.open({ tabId: tab.id });
+    if (tab) {
+      // The worker disables the panel on non-YouTube tabs; clicking this
+      // button is an explicit request, so re-enable before opening
+      await chrome.sidePanel.setOptions({ tabId: tab.id, enabled: true });
+      await chrome.sidePanel.open({ tabId: tab.id });
+    }
   } catch {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     await msg({ type: 'OPEN_SIDE_PANEL', tabId: tab?.id });
